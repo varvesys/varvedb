@@ -159,6 +159,46 @@ impl PersistedFiles {
         inner.add_persisted_file(db_id, table_id, parquet_file);
     }
 
+    /// Swap a set of compacted-away input files for the merged file that replaces them.
+    ///
+    /// Called when a compactor notifies this node that it rewrote some of this node's Parquet.
+    /// Nothing else refreshes `PersistedFiles` from object store while the process runs, so without
+    /// this the node would go on naming input files that no longer exist and would never learn
+    /// about the merged file that replaced them.
+    ///
+    /// The merged file is added *before* the inputs are dropped, so the rows it covers are
+    /// advertised by one file or the other at every instant — there is no window in which a reader
+    /// taking the lock sees neither. Deleting the input objects is deliberately not done here: the
+    /// compactor owns that, and only after a grace period long enough for queries that resolved the
+    /// old paths to finish reading them.
+    ///
+    /// Inputs are matched by path, not [`ParquetFileId`]: the caller learns which files were merged
+    /// from a compactor, which never sees this node's ids. Paths are unique cluster-wide because the
+    /// node prefix is their first component, while ids are unique only per allocator.
+    ///
+    /// Returns `(files_added, removed_records)`. The removed records carry **this node's** ids, which
+    /// the caller needs to build a snapshot's `removed_files` — the table index prunes by id even
+    /// though `PeerFiles` matches by path. They cannot be looked up afterwards, since this call is
+    /// what drops them.
+    pub fn apply_compaction(
+        &self,
+        db_id: DbId,
+        table_id: TableId,
+        added: &[ParquetFile],
+        removed_paths: &[String],
+    ) -> (usize, Vec<ParquetFile>) {
+        let removed_paths: HashSet<&str> = removed_paths.iter().map(String::as_str).collect();
+        let mut inner = self.inner.write();
+        let mut added_count = 0;
+        for file in added {
+            if inner.add_compacted_file(&db_id, &table_id, file) {
+                added_count += 1;
+            }
+        }
+        let removed = inner.remove_files_by_path(&db_id, &table_id, &removed_paths);
+        (added_count, removed)
+    }
+
     /// Get the list of files for a given database and table, always return in descending order of min_time
     pub fn get_files(&self, db_id: DbId, table_id: TableId) -> Vec<ParquetFile> {
         self.get_files_filtered(db_id, table_id, &ChunkFilter::default())
@@ -455,6 +495,88 @@ impl Inner {
             existing_parquet_files.push(parquet_file.clone());
         }
         self.parquet_files_count += 1;
+    }
+
+    /// Add a compacted file, reporting whether it was new.
+    ///
+    /// Unlike [`add_persisted_file`](Self::add_persisted_file) the file count is incremented only
+    /// when the file is actually inserted. A compaction notice is idempotent by design and may be
+    /// delivered more than once, so counting a re-delivery would inflate the metric permanently.
+    ///
+    /// Identity is the **path**, never the whole record. `ParquetFile` derives `PartialEq` over
+    /// every field including `id`, and the receiver mints a fresh `ParquetFileId` for each notice
+    /// it handles — so a redelivered notice compares unequal to the entry it duplicates. Matching
+    /// on the record would insert the same path a second time, report it as new, and send the
+    /// caller on to write another snapshot recording it. Repeat the delivery and it grows without
+    /// bound.
+    pub(crate) fn add_compacted_file(
+        &mut self,
+        db_id: &DbId,
+        table_id: &TableId,
+        parquet_file: &ParquetFile,
+    ) -> bool {
+        let existing_parquet_files = self
+            .files
+            .entry(*db_id)
+            .or_default()
+            .entry(*table_id)
+            .or_default();
+        if existing_parquet_files
+            .iter()
+            .any(|existing| existing.path == parquet_file.path)
+        {
+            return false;
+        }
+        self.parquet_files_row_count += parquet_file.row_count;
+        self.parquet_files_size_mb += as_mb(parquet_file.size_bytes);
+        self.parquet_files_count += 1;
+        existing_parquet_files.push(parquet_file.clone());
+        true
+    }
+
+    /// Drop files whose path appears in `paths`, returning the records that were removed.
+    ///
+    /// The records are returned rather than counted because they carry this node's `ParquetFileId`s,
+    /// which the caller needs for a snapshot's `removed_files` and cannot recover once dropped.
+    pub(crate) fn remove_files_by_path(
+        &mut self,
+        db_id: &DbId,
+        table_id: &TableId,
+        paths: &HashSet<&str>,
+    ) -> Vec<ParquetFile> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let Some(files) = self
+            .files
+            .get_mut(db_id)
+            .and_then(|tables| tables.get_mut(table_id))
+        else {
+            return Vec::new();
+        };
+
+        // Collect inside the closure and apply the counter updates after: `files` holds a mutable
+        // borrow of `self.files` for the duration of `retain`.
+        let mut removed: Vec<ParquetFile> = Vec::new();
+        let mut removed_rows = 0u64;
+        let mut removed_bytes = 0u64;
+        files.retain(|file| {
+            if paths.contains(&*file.path) {
+                removed_rows += file.row_count;
+                removed_bytes += file.size_bytes;
+                removed.push(file.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        self.parquet_files_row_count = self.parquet_files_row_count.saturating_sub(removed_rows);
+        self.parquet_files_size_mb = (self.parquet_files_size_mb - as_mb(removed_bytes)).max(0.0);
+        self.parquet_files_count = self
+            .parquet_files_count
+            .saturating_sub(removed.len() as u64);
+        removed
     }
 }
 

@@ -173,6 +173,9 @@ pub enum Error {
     )]
     NodeIdEnvVarMissing(String),
 
+    #[error(transparent)]
+    Cluster(#[from] influxdb3_cluster::ClusterError),
+
     #[error(
         "Python environment initialization failed: {0}\nPlease ensure Python and pip package manager is installed"
     )]
@@ -462,6 +465,9 @@ pub struct Config {
 
     #[clap(flatten)]
     pub node_id: NodeId,
+
+    #[clap(flatten)]
+    pub cluster: influxdb3_cluster::ClusterConfig,
 
     /// Maximum number of table indices to cache in memory. Queries against
     /// tables whose index is not cached must first load it from object
@@ -755,20 +761,6 @@ pub struct Config {
         action
     )]
     pub delete_grace_period: humantime::Duration,
-
-    /// The cluster-id is an enterprise config option to identify nodes belonging to the same cluster.
-    /// Core OSS is single node only. We've seen folks install Core OSS thinking they installed Enterprise.
-    /// They use --cluster-id and get the error `unexpected argument` which is confusing. So we generate
-    /// a custom error message if they use this arg.
-    #[clap(long = "cluster-id", value_parser=fail_cluster_id)]
-    pub cluster_id: Option<String>,
-}
-
-pub fn fail_cluster_id(_: &str) -> Result<String, anyhow::Error> {
-    Err(anyhow::anyhow!(
-        "You've incorrectly specified a cluster-id for InfluxDB 3 Core OSS.\n\nCluster-id is an InfluxDB 3 Enterprise parameter. \
-    \nDid you install Core in an upgrade or run Core by mistake?\n\nRemove --cluster-id to run InfluxDB 3 Core OSS."
-    ))
 }
 
 #[derive(Clone, Debug, clap::Args)]
@@ -938,7 +930,9 @@ fn resolve_legacy_size_options(config: &mut Config, user_params: &HashMap<String
 pub async fn command(mut config: Config, user_params: HashMap<String, String>) -> Result<()> {
     resolve_legacy_size_options(&mut config, &user_params);
 
-    let node_id = Arc::from(config.get_node_id()?);
+    let node_id: Arc<str> = Arc::from(config.get_node_id()?);
+    // Validates both identifiers and resolves the cluster id, which defaults to the node id.
+    let cluster = config.cluster.resolve(&node_id)?;
 
     let max_concurrent_queries = config.max_concurrent_queries.0;
 
@@ -1150,21 +1144,39 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
     ));
 
     let process_uuid_getter: Arc<dyn ProcessUuidGetter> = Arc::new(ProcessUuidWrapper::new());
-    let catalog = Catalog::new_with_shutdown(
-        Arc::clone(&node_id),
-        Arc::clone(&object_store),
-        Arc::clone(&time_provider),
-        Arc::clone(&metrics),
-        shutdown_manager.register("catalog"),
-        Arc::clone(&process_uuid_getter),
-        CatalogLimits::new(
-            CORE_NUM_DBS_LIMIT,
-            CORE_NUM_TABLES_LIMIT,
-            CORE_NUM_COLUMNS_PER_TABLE_LIMIT,
-        ),
-    )
-    .await
-    .map_err(Error::InitializeCatalog)?;
+    let catalog = if cluster.is_clustered() {
+        influxdb3_cluster::init_catalog(
+            &cluster,
+            Arc::clone(&object_store),
+            Arc::clone(&time_provider),
+            Arc::clone(&metrics),
+            &shutdown_manager,
+            Arc::clone(&process_uuid_getter),
+            Arc::new(CatalogLimits::new(
+                CORE_NUM_DBS_LIMIT,
+                CORE_NUM_TABLES_LIMIT,
+                CORE_NUM_COLUMNS_PER_TABLE_LIMIT,
+            )),
+        )
+        .await
+        .map_err(Error::InitializeCatalog)?
+    } else {
+        Catalog::new_with_shutdown(
+            Arc::clone(&node_id),
+            Arc::clone(&object_store),
+            Arc::clone(&time_provider),
+            Arc::clone(&metrics),
+            shutdown_manager.register("catalog"),
+            Arc::clone(&process_uuid_getter),
+            CatalogLimits::new(
+                CORE_NUM_DBS_LIMIT,
+                CORE_NUM_TABLES_LIMIT,
+                CORE_NUM_COLUMNS_PER_TABLE_LIMIT,
+            ),
+        )
+        .await
+        .map_err(Error::InitializeCatalog)?
+    };
     info!(catalog_uuid = ?catalog.catalog_uuid(), "catalog initialized");
 
     let retention_handler_token = shutdown_manager.register("retention_handler");
@@ -1208,10 +1220,13 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
         .register_node(
             &node_id,
             num_cpus as u64,
-            vec![influxdb3_catalog::catalog::NodeMode::Core],
+            cluster.modes(),
             process_uuid_getter,
             instance_id,
-            None,
+            // Publish where peers can reach this node's cluster RPC. `None` in single-node, where
+            // nothing else is looking, and `None` for a query-only node, which serves no buffered
+            // rows — advertising an address there would invite peers to dial a port we never bind.
+            (cluster.is_clustered() && cluster.ingests()).then(|| cluster.conn_info()),
             Some(cli_params),
             0,
         )
@@ -1343,7 +1358,22 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
     })
     .await;
 
-    let write_buffer: Arc<dyn WriteBuffer> = write_buffer_impl;
+    let write_buffer: Arc<dyn WriteBuffer> = if cluster.is_clustered() {
+        influxdb3_cluster::wrap_write_buffer(
+            &cluster,
+            Arc::clone(&write_buffer_impl),
+            Arc::clone(&catalog),
+            Arc::clone(&persister),
+            Arc::clone(&time_provider) as _,
+            Arc::clone(&exec),
+            &shutdown_manager,
+            config
+                .query_file_limit
+                .unwrap_or(influxdb3_cluster::DEFAULT_QUERY_FILE_LIMIT),
+        )
+    } else {
+        write_buffer_impl
+    };
 
     let common_state = CommonServerState::new(
         Arc::clone(&catalog),

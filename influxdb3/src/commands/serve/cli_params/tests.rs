@@ -195,8 +195,6 @@ fn extract_config_file_options(config_content: &str) -> HashSet<String> {
 const CONFIG_EXCLUDED_OPTIONS: &[&str] = &[
     // Verbose flag - typically used only on command line for debugging
     "verbose",
-    // Enterprise-only option that errors when used with Core OSS
-    "cluster-id",
 ];
 
 /// Options that exist in the config file but not in CLI.

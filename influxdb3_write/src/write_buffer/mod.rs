@@ -140,6 +140,12 @@ pub enum Error {
     #[error("cannot write to a compactor-only server")]
     NoWriteInCompactorOnly,
 
+    #[error(
+        "this node runs in query-only mode and does not accept writes; send writes to a node \
+         started with --mode ingest"
+    )]
+    NodeIsQueryOnly,
+
     #[error("error: {0}")]
     AnyhowError(#[from] anyhow::Error),
 
@@ -458,6 +464,15 @@ impl WriteBufferImpl {
 
     pub fn persisted_files(&self) -> Arc<PersistedFiles> {
         Arc::clone(&self.persisted_files)
+    }
+
+    /// The in-memory buffer holding writes that have not yet been persisted as Parquet.
+    ///
+    /// Exposed so that a cluster node can serve *only* its un-persisted rows to peers. Peers index
+    /// each other's Parquet independently, so serving `get_table_chunks` (buffer + Parquet) instead
+    /// would double-count.
+    pub fn buffer(&self) -> Arc<QueryableBuffer> {
+        Arc::clone(&self.buffer)
     }
 
     async fn write_lp(

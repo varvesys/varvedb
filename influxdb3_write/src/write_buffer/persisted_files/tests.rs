@@ -520,3 +520,120 @@ fn test_new_from_checkpoints_pending_removed_missing_db() {
     let (file_count, _, _) = persisted_files.get_metrics();
     assert_eq!(0, file_count);
 }
+
+#[test]
+fn test_apply_compaction_swaps_inputs_for_merged_file() {
+    let inputs = build_parquet_files("input_", 4);
+    let snapshot = build_snapshot(inputs.clone(), 1, 1, 1);
+    let persisted_files =
+        PersistedFiles::new_from_persisted_snapshots(None, Arc::new(vec![snapshot]));
+
+    let db_id = DbId::from(0);
+    let table_id = TableId::from(0);
+    assert_eq!(persisted_files.get_files(db_id, table_id).len(), 4);
+
+    // Merge the first three; the fourth is untouched and must survive.
+    let removed_paths: Vec<String> = inputs[..3].iter().map(|f| f.path.to_string()).collect();
+    let merged = ParquetFile {
+        id: ParquetFileId::from(90_001),
+        path: "/random/path/merged.parquet".into(),
+        size_bytes: 140_000,
+        row_count: 30,
+        chunk_time: 10,
+        min_time: 10,
+        max_time: 200,
+    };
+
+    let (added, removed) = persisted_files.apply_compaction(
+        db_id,
+        table_id,
+        std::slice::from_ref(&merged),
+        &removed_paths,
+    );
+    assert_eq!(added, 1);
+    assert_eq!(removed.len(), 3);
+
+    // The returned records must carry this node's own ids: the caller puts them in a snapshot's
+    // `removed_files`, and the table index prunes by `ParquetFileId`, not by path.
+    let mut removed_ids: Vec<_> = removed.iter().map(|f| f.id).collect();
+    removed_ids.sort();
+    let mut expected_ids: Vec<_> = inputs[..3].iter().map(|f| f.id).collect();
+    expected_ids.sort();
+    assert_eq!(removed_ids, expected_ids);
+
+    let files = persisted_files.get_files(db_id, table_id);
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().any(|f| f.path == merged.path));
+    assert!(files.iter().any(|f| f.path == inputs[3].path));
+    for input in &inputs[..3] {
+        assert!(
+            !files.iter().any(|f| f.path == input.path),
+            "{} should have been swapped out",
+            input.path
+        );
+    }
+
+    // Metrics must track the swap, not just the addition.
+    let (file_count, _size_mb, row_count) = persisted_files.get_metrics();
+    assert_eq!(file_count, 2);
+    assert_eq!(
+        row_count,
+        10 + 30,
+        "one surviving input plus the merged file"
+    );
+}
+
+#[test]
+fn test_apply_compaction_is_idempotent() {
+    // A compaction notice carries a pointer to a durable snapshot and may be delivered more than
+    // once — on retry, or after the peer already applied it. Re-applying must not double-count.
+    let inputs = build_parquet_files("input_", 3);
+    let snapshot = build_snapshot(inputs.clone(), 1, 1, 1);
+    let persisted_files =
+        PersistedFiles::new_from_persisted_snapshots(None, Arc::new(vec![snapshot]));
+
+    let db_id = DbId::from(0);
+    let table_id = TableId::from(0);
+    let removed_paths: Vec<String> = inputs.iter().map(|f| f.path.to_string()).collect();
+    let merged = ParquetFile {
+        id: ParquetFileId::from(90_002),
+        path: "/random/path/merged.parquet".into(),
+        size_bytes: 140_000,
+        row_count: 30,
+        chunk_time: 10,
+        min_time: 10,
+        max_time: 200,
+    };
+
+    let first = persisted_files.apply_compaction(
+        db_id,
+        table_id,
+        std::slice::from_ref(&merged),
+        &removed_paths,
+    );
+    assert_eq!(first.0, 1);
+    assert_eq!(first.1.len(), 3);
+
+    // Redeliver with a **freshly minted id**, which is what actually happens: the receiver calls
+    // `notice.merged_file(ParquetFileId::new())` on every notice, so the second delivery is never
+    // the same record as the first. Reusing `merged` here would compare equal on every field and
+    // pass no matter how identity was decided — the test would agree with a broken implementation.
+    let redelivered = ParquetFile {
+        id: ParquetFileId::from(90_003),
+        ..merged.clone()
+    };
+    let second = persisted_files.apply_compaction(
+        db_id,
+        table_id,
+        std::slice::from_ref(&redelivered),
+        &removed_paths,
+    );
+    // The receiver detects a redelivery from this alone — nothing added, nothing removed — which is
+    // what lets it skip writing a second snapshot and burning a sequence number to say nothing.
+    assert_eq!(second.0, 0, "replay must add nothing");
+    assert!(second.1.is_empty(), "replay must remove nothing");
+
+    let (file_count, _, row_count) = persisted_files.get_metrics();
+    assert_eq!(file_count, 1, "same path must not be counted twice");
+    assert_eq!(row_count, 30);
+}

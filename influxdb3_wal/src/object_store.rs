@@ -661,6 +661,19 @@ impl Wal for WalObjectStore {
             .last_snapshot_sequence_number()
     }
 
+    async fn reserve_snapshot_sequence_number(&self) -> SnapshotSequenceNumber {
+        // Allocating under the same lock the flush path uses is what makes this safe: a concurrent
+        // `flush_buffer` cannot observe or reuse the number handed out here.
+        //
+        // The lock is released before the caller writes anything, which mirrors the flush path —
+        // it too allocates under this lock and PUTs the WAL file after releasing it.
+        self.flush_buffer
+            .lock()
+            .await
+            .snapshot_tracker
+            .reserve_snapshot_sequence_number()
+    }
+
     async fn shutdown(&self) {
         // stop accepting writes
         self.flush_buffer
