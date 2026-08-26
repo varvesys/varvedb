@@ -32,6 +32,7 @@ const NON_SENSITIVE_PARAMS: &[&str] = &[
     "cluster-id",
     "catalog-sync-interval",
     "file-index-sync-interval",
+    "file-index-snapshot-interval",
     "cluster-rpc-bind",
     "mode",
     "compact-interval",

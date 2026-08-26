@@ -28,7 +28,7 @@ use std::sync::Arc;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, PutPayload};
 use object_store_utils::{PutNonce, SelfVerifyingCreate};
-use observability_deps::tracing::{debug, info, warn};
+use observability_deps::tracing::{debug, error, info, warn};
 
 use super::{FileIndex, FileIndexDelta, FileIndexLogEntry, FileIndexSequence, FileIndexSnapshot};
 
@@ -148,11 +148,68 @@ impl FileIndexLog {
     pub async fn sync(&self, index: &FileIndex) -> Result<usize> {
         let mut entries = self.load_after(index.sequence()).await?;
         entries.sort_by_key(|e| e.sequence);
+
+        // A rollup deletes the entries it covers, so a reader that had not caught up to the
+        // snapshot finds them simply gone. Reading forward from its own position would then skip
+        // straight past them — applying 21 onward while never seeing 6..20 — and every removal in
+        // that range would be lost permanently. The reader would go on serving files that have
+        // since been deleted, and nothing would ever correct it.
+        //
+        // A gap between our position and the oldest surviving entry is exactly that situation.
+        // The snapshot holds the state those entries produced, so restoring from it is the
+        // recovery.
+        let gap = entries
+            .first()
+            .is_some_and(|first| first.sequence.as_u64() > index.sequence().as_u64() + 1);
+
+        if gap {
+            warn!(
+                reader_at = %index.sequence(),
+                oldest_available = %entries[0].sequence,
+                "file index log was pruned past this reader; restoring from snapshot"
+            );
+            self.restore_from_snapshot(index).await?;
+        }
+
         let count = entries.len();
         for entry in entries {
             index.apply(&entry);
         }
         Ok(count)
+    }
+
+    /// Reload the rolled-up snapshot into an existing index.
+    ///
+    /// Note this only *raises* the index's position — [`FileIndex::restore`] takes the max — so a
+    /// reader already ahead of the snapshot is unaffected.
+    async fn restore_from_snapshot(&self, index: &FileIndex) -> Result<()> {
+        match self.object_store.get(&self.snapshot_path()).await {
+            Ok(result) => {
+                let bytes = result.bytes().await?;
+                let snapshot: FileIndexSnapshot =
+                    serde_json::from_slice(&bytes).map_err(|source| {
+                        FileIndexLogError::Malformed {
+                            path: self.snapshot_path().to_string(),
+                            source,
+                        }
+                    })?;
+                // Reset, not merge: this reader holds files the snapshot has since retired, and
+                // keeping them is precisely the failure being recovered from.
+                index.reset_from(&snapshot);
+                Ok(())
+            }
+            // A gap with no snapshot to recover from should be impossible: only a rollup prunes,
+            // and it writes the snapshot first. Loud rather than silent, because continuing would
+            // mean serving an index that is knowably wrong.
+            Err(object_store::Error::NotFound { .. }) => {
+                error!(
+                    "file index log has a gap but no snapshot exists; \
+                     this index may be missing removals"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Fetch every log object with a sequence strictly greater than `after`.
@@ -277,7 +334,62 @@ impl FileIndexLog {
             files = snapshot.files.len(),
             "wrote file index snapshot"
         );
+
+        // Only now that the snapshot is durable. The reverse order would leave a window in which
+        // the entries were gone and nothing had replaced them, and a node loading during that
+        // window would silently come up missing files.
+        let pruned = self.prune_logs_through(snapshot.sequence).await?;
+        if pruned > 0 {
+            debug!(
+                pruned,
+                through = %snapshot.sequence,
+                "pruned file index log entries behind the snapshot"
+            );
+        }
         Ok(())
+    }
+
+    /// Delete log entries at or below `through`, which the snapshot now covers.
+    ///
+    /// Without this the prefix grows forever: replay already ignores these entries, but nothing
+    /// reclaims them. That would undercut the reason this log exists rather than catalog records
+    /// — being able to discard superseded history is the difference.
+    ///
+    /// Safe to repeat and safe to interrupt. A `NotFound` means someone else pruned the same
+    /// entry, which is the expected outcome when two nodes roll up around the same sequence.
+    async fn prune_logs_through(&self, through: FileIndexSequence) -> Result<usize> {
+        use futures::StreamExt;
+
+        let mut listing = self.object_store.list(Some(&self.logs_dir()));
+        let mut doomed = Vec::new();
+        while let Some(item) = listing.next().await {
+            let location = item?.location;
+            // Parse the sequence back out of the filename rather than trusting listing order.
+            // Deleting by position would be one off-by-one away from discarding an entry the
+            // snapshot does not cover.
+            let covered = location
+                .filename()
+                .and_then(|name| name.strip_suffix(".json"))
+                .and_then(|digits| digits.parse::<u64>().ok())
+                .is_some_and(|seq| seq <= through.as_u64());
+            if covered {
+                doomed.push(location);
+            }
+        }
+
+        let mut pruned = 0;
+        for location in doomed {
+            match self.object_store.delete(&location).await {
+                Ok(()) => pruned += 1,
+                Err(object_store::Error::NotFound { .. }) => {}
+                // A failed delete costs storage, never correctness — the snapshot already covers
+                // these entries and replay skips them. Leave it for the next rollup.
+                Err(error) => {
+                    warn!(%error, %location, "failed to prune file index log entry");
+                }
+            }
+        }
+        Ok(pruned)
     }
 }
 

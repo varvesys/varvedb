@@ -370,7 +370,30 @@ impl FileIndex {
         self.restore(&other.to_snapshot());
     }
 
+    /// Replace this index's contents with a rollup snapshot.
+    ///
+    /// Unlike [`restore`](Self::restore), which merges, this **discards** what the index held
+    /// first. That distinction is load-bearing: a reader recovering from a pruned log is holding
+    /// files the snapshot no longer lists, and merging would keep them — leaving it serving paths
+    /// that have since been deleted, which is the failure being recovered from.
+    ///
+    /// Only correct for a reader that is strictly *behind* the snapshot. A reader ahead of it
+    /// would lose entries it had legitimately applied.
+    pub fn reset_from(&self, snapshot: &FileIndexSnapshot) {
+        {
+            let mut inner = self.inner.write();
+            inner.nodes.clear();
+            inner.watermarks.clear();
+            inner.persisted_max_times.clear();
+            inner.sequence = FileIndexSequence::default();
+        }
+        self.restore(snapshot);
+    }
+
     /// Rebuild from a rollup snapshot, preserving every file's original log position.
+    ///
+    /// Additive: entries already present are kept. Use [`reset_from`](Self::reset_from) when the
+    /// index may hold state the snapshot has superseded.
     pub fn restore(&self, snapshot: &FileIndexSnapshot) {
         let mut inner = self.inner.write();
         for entry in &snapshot.files {

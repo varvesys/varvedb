@@ -39,6 +39,58 @@
 //!
 //! Both were tried. Neither is recoverable from without the owner minting.
 //!
+//! # Exactly one compactor may run per cluster
+//!
+//! This is an **operational invariant, enforced nowhere.** [`resolve_modes`] takes no catalog and
+//! so cannot check it; node registration does not look; `init::wrap_write_buffer` spawns
+//! unconditionally. Two `--mode compact` nodes start cleanly, and so do two processes sharing one
+//! `--node-id`, because the second reuses the first's `instance_id` from the catalog.
+//!
+//! Upstream assumes the same thing — `RemoveNodeOp` calls compactor mode "the single-writer
+//! primary-lease holder" — but the lease it refers to lives in Enterprise and is not in this tree.
+//!
+//! ## Why it looks safe when it is not
+//!
+//! Two compactors that pick the *same* input set are nearly harmless, which is exactly what makes
+//! this easy to get wrong. [`output_path_discriminator`] hashes the sorted input paths, so an
+//! identical set yields an identical output path; the second [`CompactionNotice`] finds nothing to
+//! add or remove and returns without writing a snapshot; a double delete swallows `NotFound`. A
+//! short test with two compactors will therefore pass.
+//!
+//! ## What actually breaks
+//!
+//! They cannot be relied on to pick the same set. `cold_before` is wall-clock, so two loops
+//! ticking at different instants disagree about which files are cold; and each reads its own
+//! [`FileIndex`] replica, which lags the log by up to a sync interval. [`select_merges`] packs
+//! greedily, so a single file's difference at the head shifts every later group boundary — the two
+//! partitions diverge completely rather than locally.
+//!
+//! One compactor merges `{f1,f2,f3}` into `M_A`; the other merges `{f2,f3,f4}` into `M_B`. Both
+//! notices do real work, both outputs stay live, and each holds the overlap. Query-time
+//! deduplication keeps *results* correct, which is why this never surfaces as an error — it shows
+//! up only as permanently duplicated storage, extra dedup work, and inflated counts against
+//! `--query-file-limit`. Nothing detects or repairs it, and every subsequent pass can overlap
+//! again.
+//!
+//! A smaller hazard rides along: the output PUT is unconditional, so concurrent identical merges
+//! race on one object while the index keeps only the first notice's `size_bytes` — which is handed
+//! to the reader as `ObjectMeta.size`. The writer properties are fixed, so the bytes are almost
+//! certainly identical; nothing enforces or checks that they are.
+//!
+//! ## Replacing a dead compactor
+//!
+//! There is no heartbeat, TTL or lease anywhere in this tree, and the only `Running -> Stopped`
+//! transition is the graceful-shutdown hook. A compactor killed abruptly stays `Running` forever.
+//! It is also unremovable: `RemoveNodeOp`'s compactor check runs *before* its state check, so a
+//! `Compact` node cannot be removed in **any** state, `Stopped` included.
+//!
+//! So replace a dead compactor by starting the new process under the **same `--node-id`** — which
+//! works, because the reused `instance_id` satisfies re-registration. Do not expect to remove it
+//! and re-add it under a new name.
+//!
+//! [`resolve_modes`]: crate::config
+//! [`FileIndex`]: crate::file_index::FileIndex
+//!
 //! # Failure is cheap
 //!
 //! Until the owner acknowledges, nothing has been given up: the inputs are intact and still
@@ -201,7 +253,9 @@ pub fn select_merges(
 /// that only ingests never dereferences that list, so a lost notice costs nothing but stale
 /// metrics.
 ///
-/// A peer already carrying `Compact` is skipped too, so two compactors cannot target one prefix.
+/// A peer already carrying `Compact` is skipped as well, so compactors never rewrite each other's
+/// files. Note this says nothing about two compactors converging on a *third* node's prefix — see
+/// the module header on why exactly one compactor may run.
 fn is_compactable(modes: &[NodeMode]) -> bool {
     let ingests = modes.iter().any(|m| matches!(m, NodeMode::Ingest));
     let serves_queries = modes

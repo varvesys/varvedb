@@ -470,22 +470,14 @@ async fn snapshot_lets_the_log_be_replayed_from_a_later_point() {
 
     log.write_snapshot(&index).await.unwrap();
 
-    // Delete every log object: the snapshot alone must carry the full live set. This is the
-    // property that makes compaction traffic affordable here and impossible in the catalog.
-    let mut listing = store.list(Some(&object_store::path::Path::from(
-        "mycluster/file-index/logs",
-    )));
-    let mut locations = Vec::new();
-    {
-        use futures::StreamExt;
-        while let Some(item) = listing.next().await {
-            locations.push(item.unwrap().location);
-        }
-    }
-    assert_eq!(locations.len(), 6);
-    for location in locations {
-        store.delete(&location).await.unwrap();
-    }
+    // The rollup prunes the entries it covers, so the snapshot is now the *only* record of these
+    // files. That is the property making compaction traffic affordable here and impossible in the
+    // catalog, which can never discard a record it has applied.
+    assert_eq!(
+        log_count(&store).await,
+        0,
+        "the rollup should have reclaimed every entry it covers"
+    );
 
     let reloaded = FileIndexLog::new(Arc::clone(&store), "mycluster".into())
         .load()
@@ -589,4 +581,271 @@ fn watermarks_survive_a_rollup_snapshot() {
         restored.published_watermark("host01"),
         index.published_watermark("host01")
     );
+}
+
+// ---- rollup pruning ----
+
+/// Count log objects remaining under the logs prefix.
+async fn log_count(store: &Arc<dyn ObjectStore>) -> usize {
+    use futures::StreamExt;
+    let mut listing = store.list(Some(&object_store::path::Path::from(
+        "mycluster/file-index/logs",
+    )));
+    let mut n = 0;
+    while let Some(item) = listing.next().await {
+        item.unwrap();
+        n += 1;
+    }
+    n
+}
+
+#[tokio::test]
+async fn a_rollup_prunes_the_entries_it_covers() {
+    let (log, store) = log();
+    let index = FileIndex::new();
+
+    for i in 0..5u64 {
+        log.append(
+            &index,
+            vec![delta(
+                "host01",
+                vec![file(i, &format!("host01/{i}.parquet"), 0, 10)],
+                vec![],
+            )],
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(log_count(&store).await, 5);
+
+    log.write_snapshot(&index).await.unwrap();
+
+    assert_eq!(
+        log_count(&store).await,
+        0,
+        "every entry the snapshot covers must be reclaimed"
+    );
+}
+
+#[tokio::test]
+async fn pruning_leaves_entries_the_snapshot_does_not_cover() {
+    // The off-by-one that matters. An entry above the snapshot's sequence holds changes the
+    // snapshot never saw; deleting it would lose them outright.
+    let (log, store) = log();
+    let index = FileIndex::new();
+
+    log.append(
+        &index,
+        vec![delta(
+            "host01",
+            vec![file(1, "host01/a.parquet", 0, 10)],
+            vec![],
+        )],
+    )
+    .await
+    .unwrap();
+
+    // Snapshot at sequence 1, then append more.
+    log.write_snapshot(&index).await.unwrap();
+    assert_eq!(log_count(&store).await, 0);
+
+    log.append(
+        &index,
+        vec![delta(
+            "host01",
+            vec![file(2, "host01/b.parquet", 0, 10)],
+            vec![],
+        )],
+    )
+    .await
+    .unwrap();
+    assert_eq!(log_count(&store).await, 1, "the newer entry must survive");
+
+    // A fresh reader must still see both files: one from the snapshot, one from the tail.
+    let reloaded = FileIndexLog::new(Arc::clone(&store), "mycluster".into())
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(reloaded.file_count(), 2);
+    assert_eq!(paths(&reloaded), paths(&index));
+}
+
+#[tokio::test]
+async fn rollup_then_prune_still_replays_to_the_same_index() {
+    let (log, store) = log();
+    let index = FileIndex::new();
+
+    for i in 0..4u64 {
+        log.append(
+            &index,
+            vec![delta(
+                "host01",
+                vec![file(i, &format!("host01/{i}.parquet"), 0, 10)],
+                vec![],
+            )],
+        )
+        .await
+        .unwrap();
+    }
+    log.append(
+        &index,
+        vec![delta("host01", vec![], vec!["host01/0.parquet"])],
+    )
+    .await
+    .unwrap();
+
+    log.write_snapshot(&index).await.unwrap();
+
+    let reloaded = FileIndexLog::new(Arc::clone(&store), "mycluster".into())
+        .load()
+        .await
+        .unwrap();
+
+    assert_eq!(paths(&reloaded), paths(&index));
+    assert_eq!(reloaded.sequence(), index.sequence());
+    assert_eq!(
+        reloaded.published_watermark("host01"),
+        index.published_watermark("host01"),
+        "watermarks must survive a rollup that discarded the log they came from"
+    );
+    assert_eq!(
+        reloaded.persisted_max_time("host01"),
+        index.persisted_max_time("host01")
+    );
+}
+
+#[tokio::test]
+async fn pruning_is_safe_to_repeat() {
+    // Two nodes rolling up around the same sequence both try to delete the same entries. The
+    // loser must treat NotFound as success, not as a failure worth retrying forever.
+    let (log, store) = log();
+    let index = FileIndex::new();
+    log.append(
+        &index,
+        vec![delta(
+            "host01",
+            vec![file(1, "host01/a.parquet", 0, 10)],
+            vec![],
+        )],
+    )
+    .await
+    .unwrap();
+
+    log.write_snapshot(&index).await.unwrap();
+    log.write_snapshot(&index).await.unwrap();
+
+    assert_eq!(log_count(&store).await, 0);
+    let reloaded = FileIndexLog::new(Arc::clone(&store), "mycluster".into())
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(reloaded.file_count(), 1);
+}
+
+#[tokio::test]
+async fn a_reader_pruned_past_recovers_from_the_snapshot() {
+    // The bug the load test surfaced, and the one that makes pruning dangerous.
+    //
+    // A rollup deletes the entries it covers. A reader that had not caught up finds them gone,
+    // and reading forward from its own position skips them entirely — every removal they carried
+    // is lost, permanently, and the reader goes on serving files that were deleted. That is
+    // exactly what happened: queries failed with NotFound on paths the compactor had reclaimed.
+    let (log, store) = log();
+    let writer = FileIndex::new();
+
+    // A reader that saw only the first entry, then fell behind.
+    log.append(
+        &writer,
+        vec![delta(
+            "host01",
+            vec![
+                file(1, "host01/a.parquet", 0, 10),
+                file(2, "host01/b.parquet", 0, 10),
+            ],
+            vec![],
+        )],
+    )
+    .await
+    .unwrap();
+
+    let reader_log = FileIndexLog::new(Arc::clone(&store), "mycluster".into());
+    let reader = reader_log.load().await.unwrap();
+    assert_eq!(reader.file_count(), 2);
+    let stalled_at = reader.sequence();
+
+    // The cluster moves on: a compaction retires both files for a merged one.
+    log.append(
+        &writer,
+        vec![delta(
+            "host01",
+            vec![file(3, "host01/merged.parquet", 0, 10)],
+            vec!["host01/a.parquet", "host01/b.parquet"],
+        )],
+    )
+    .await
+    .unwrap();
+
+    // A rollup prunes everything up to here — including the entry the reader never saw.
+    log.write_snapshot(&writer).await.unwrap();
+    assert_eq!(log_count(&store).await, 0);
+
+    // Something new lands, so the reader has a reason to sync.
+    log.append(
+        &writer,
+        vec![delta(
+            "host01",
+            vec![file(4, "host01/c.parquet", 0, 10)],
+            vec![],
+        )],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(reader.sequence(), stalled_at, "reader has not moved yet");
+    reader_log.sync(&reader).await.unwrap();
+
+    assert_eq!(
+        paths(&reader),
+        paths(&writer),
+        "a reader pruned past must recover the removals it missed, not skip over them"
+    );
+    assert!(
+        !paths(&reader).iter().any(|p| p.contains("a.parquet")),
+        "the compacted-away file must be gone; serving it would be a NotFound at query time"
+    );
+}
+
+#[tokio::test]
+async fn a_caught_up_reader_does_not_reload_the_snapshot() {
+    // Gap recovery must be the exception. A reader in step with the log should apply entries
+    // forward and never pay for a snapshot fetch.
+    let (log, store) = log();
+    let writer = FileIndex::new();
+    log.append(
+        &writer,
+        vec![delta(
+            "host01",
+            vec![file(1, "host01/a.parquet", 0, 10)],
+            vec![],
+        )],
+    )
+    .await
+    .unwrap();
+
+    let reader_log = FileIndexLog::new(Arc::clone(&store), "mycluster".into());
+    let reader = reader_log.load().await.unwrap();
+
+    log.append(
+        &writer,
+        vec![delta(
+            "host01",
+            vec![file(2, "host01/b.parquet", 0, 10)],
+            vec![],
+        )],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(reader_log.sync(&reader).await.unwrap(), 1);
+    assert_eq!(paths(&reader), paths(&writer));
 }

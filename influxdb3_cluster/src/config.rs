@@ -103,6 +103,24 @@ pub struct ClusterConfig {
     )]
     pub peer_sync_interval: humantime::Duration,
 
+    /// How many log appends between rollup snapshots of the cluster file index.
+    ///
+    /// A rollup collapses the log into a single object holding the live file set, after which the
+    /// entries behind it are deleted. This is what keeps the index affordable under compaction —
+    /// a merge that replaces a hundred files with one leaves a hundred removals in the log, and
+    /// the rollup is what discards them.
+    ///
+    /// Lower values bound replay work for a starting node and reclaim storage sooner, at the cost
+    /// of rewriting the full live set more often. Tune to the deployment's churn rate: a cluster
+    /// merging constantly wants a lower value than one that mostly appends.
+    #[clap(
+        long = "file-index-snapshot-interval",
+        env = "INFLUXDB3_FILE_INDEX_SNAPSHOT_INTERVAL",
+        default_value = "500",
+        action
+    )]
+    pub file_index_snapshot_interval: u64,
+
     /// Address this node binds for serving its un-persisted rows to peers.
     ///
     /// Only used when `--cluster-id` differs from `--node-id`. The address is published to the
@@ -236,6 +254,7 @@ impl ClusterConfig {
             cluster_id: Arc::from(cluster_id),
             catalog_sync_interval: self.catalog_sync_interval.into(),
             peer_sync_interval: self.peer_sync_interval.into(),
+            file_index_snapshot_interval: self.file_index_snapshot_interval,
             cluster_rpc_bind: self.cluster_rpc_bind,
             modes,
             compaction: self.compaction,
@@ -310,6 +329,7 @@ pub struct ClusterIdentity {
     cluster_id: Arc<str>,
     catalog_sync_interval: Duration,
     peer_sync_interval: Duration,
+    file_index_snapshot_interval: u64,
     cluster_rpc_bind: std::net::SocketAddr,
     modes: Vec<NodeMode>,
     compaction: CompactionConfig,
@@ -326,6 +346,11 @@ impl ClusterIdentity {
 
     pub fn catalog_sync_interval(&self) -> Duration {
         self.catalog_sync_interval
+    }
+
+    /// Log appends between rollup snapshots of the file index.
+    pub fn file_index_snapshot_interval(&self) -> u64 {
+        self.file_index_snapshot_interval
     }
 
     pub fn peer_sync_interval(&self) -> Duration {

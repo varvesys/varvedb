@@ -98,10 +98,10 @@ pub fn wrap_write_buffer(
     // count but the ordering — one CAS-assigned sequence spans the whole cluster, where per-node
     // snapshot sequences were never comparable to each other.
     let file_index = Arc::new(FileIndex::new());
-    let file_index_log = Arc::new(FileIndexLog::new(
-        persister.object_store(),
-        Arc::clone(identity.cluster_id()),
-    ));
+    let file_index_log = Arc::new(
+        FileIndexLog::new(persister.object_store(), Arc::clone(identity.cluster_id()))
+            .with_snapshot_interval(identity.file_index_snapshot_interval()),
+    );
 
     // Serve this node's un-persisted rows to peers. Bound to its own port because
     // `influxdb3_server`'s UnifiedService accepts exactly one gRPC service.
@@ -140,6 +140,8 @@ pub fn wrap_write_buffer(
             Arc::clone(&file_index_log),
             Arc::clone(&file_index),
             inner.watch_persisted_snapshots(),
+            identity.peer_sync_interval(),
+            Arc::clone(&time_provider),
             shutdown_manager.register("file_index_publisher"),
         );
     }

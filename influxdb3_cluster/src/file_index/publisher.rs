@@ -19,6 +19,19 @@
 //! `persist_snapshot()` has durably written the manifest, so anything we are told about is
 //! readable; and nothing is sent when a snapshot had no persist jobs and no removals, so a wake-up
 //! never implies there is work.
+//!
+//! # Not every manifest fires the watch
+//!
+//! The channel's only sender lives in `QueryableBuffer`'s snapshot task. A **compaction manifest**
+//! is written by the peer-RPC handler calling `persist_snapshot` directly, so it never rings the
+//! bell at all. A publisher that waited solely on the watch would not learn that a compaction had
+//! replaced files until some *unrelated* snapshot happened to fire it — while the compactor, on
+//! its own grace timer, deletes the inputs regardless. Queries then resolve paths that no longer
+//! exist and fail outright.
+//!
+//! That is not hypothetical: it is what a load test produced, as `NotFound` on every query
+//! touching the affected table. So the loop also ticks on an interval. The watch makes publishing
+//! *prompt*; the tick makes it *reliable*, and reliability is what correctness depends on here.
 
 use std::sync::Arc;
 
@@ -38,25 +51,41 @@ use super::{FileIndex, FileIndexDelta};
 const MAX_MANIFESTS_PER_PASS: usize = 256;
 
 /// Spawn the publisher. Only meaningful on a node that ingests.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_file_index_publisher(
     node_id: Arc<str>,
     persister: Arc<Persister>,
     log: Arc<FileIndexLog>,
     index: Arc<FileIndex>,
     snapshot_rx: watch::Receiver<Option<PersistedSnapshotVersion>>,
+    tick: std::time::Duration,
+    time_provider: Arc<dyn iox_time::TimeProvider>,
     shutdown: ShutdownToken,
 ) {
     tokio::spawn(async move {
-        run_publisher(node_id, persister, log, index, snapshot_rx, shutdown).await;
+        run_publisher(
+            node_id,
+            persister,
+            log,
+            index,
+            snapshot_rx,
+            tick,
+            time_provider,
+            shutdown,
+        )
+        .await;
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_publisher(
     node_id: Arc<str>,
     persister: Arc<Persister>,
     log: Arc<FileIndexLog>,
     index: Arc<FileIndex>,
     mut snapshot_rx: watch::Receiver<Option<PersistedSnapshotVersion>>,
+    tick: std::time::Duration,
+    time_provider: Arc<dyn iox_time::TimeProvider>,
     shutdown: ShutdownToken,
 ) {
     // Publish anything this node persisted while it was down, before waiting on the channel at
@@ -66,8 +95,20 @@ async fn run_publisher(
         warn!(%error, "initial file index catch-up failed; will retry on next snapshot");
     }
 
+    let mut next_tick = time_provider.now() + tick;
     loop {
         tokio::select! {
+            // The safety net. Catches manifests no watch announced — compaction being the one
+            // that matters — and costs a listing of this node's own snapshot prefix per tick.
+            _ = time_provider.sleep_until(next_tick) => {
+                if shutdown.is_cancelled() {
+                    break;
+                }
+                if let Err(error) = publish_pending(&node_id, &persister, &log, &index).await {
+                    warn!(%error, "scheduled file index publish failed; will retry");
+                }
+                next_tick = time_provider.now() + tick;
+            }
             changed = snapshot_rx.changed() => {
                 if changed.is_err() {
                     // The only sender lives on the queryable buffer, so this means the buffer is
@@ -83,6 +124,7 @@ async fn run_publisher(
                     // retries exactly the manifests that did not land.
                     error!(%error, "failed to publish to file index; will retry");
                 }
+                next_tick = time_provider.now() + tick;
             }
             _ = shutdown.wait_for_shutdown() => break,
         }

@@ -240,3 +240,43 @@ async fn nothing_to_publish_is_not_an_error() {
     assert_eq!(h.index.file_count(), 0);
     assert_eq!(h.index.published_watermark(NODE), None);
 }
+
+#[tokio::test]
+async fn a_manifest_that_never_fired_the_watch_is_still_published() {
+    // The load-test bug. A compaction manifest is written by the peer-RPC handler calling
+    // `persist_snapshot` directly, and the watch channel's only sender lives in the regular
+    // snapshot task — so no notification is ever emitted for it.
+    //
+    // Waiting solely on the watch left the removal unpublished while the compactor, on its own
+    // grace timer, deleted the input files anyway. Queries then resolved paths that no longer
+    // existed and failed with NotFound. The scheduled pass is what makes that impossible: it
+    // reads manifests regardless of whether anything announced them.
+    let h = harness();
+    h.persist(&manifest(
+        1,
+        vec![file(1, "host01/a.parquet"), file(2, "host01/b.parquet")],
+        vec![],
+    ))
+    .await;
+    h.publish().await;
+    assert_eq!(h.index.file_count(), 2);
+
+    // A compaction lands: inputs retired, merged output added. No watch notification accompanies
+    // it — which is exactly why the publisher must not depend on one.
+    h.persist(&manifest(
+        2,
+        vec![file(3, "host01/merged.parquet")],
+        vec![file(1, "host01/a.parquet"), file(2, "host01/b.parquet")],
+    ))
+    .await;
+
+    // The scheduled pass, standing in for the tick rather than a notification.
+    h.publish().await;
+
+    assert_eq!(
+        h.paths(),
+        vec!["host01/merged.parquet"],
+        "the removal must reach the index without any watch notification, or queries will \
+         resolve files the compactor has already deleted"
+    );
+}
