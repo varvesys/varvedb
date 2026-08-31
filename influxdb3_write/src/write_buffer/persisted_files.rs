@@ -394,7 +394,16 @@ impl Inner {
         let mut size_in_mb = 0.0;
         let mut row_count = 0;
 
-        let files = persisted_snapshots.iter().fold(
+        // Fold oldest-first. Callers load snapshots newest-first (object store paths are
+        // `u64::MAX - sequence`, so a lexicographic listing descends), and each snapshot's
+        // `removed_files` refers to files added by *earlier* ones. Applying a removal before the
+        // addition it cancels makes the removal a silent no-op — `update_persisted_files_with_snapshot`
+        // matches on id and simply finds nothing — after which the older snapshot re-adds the file.
+        // Every deleted input then comes back at startup and the node serves paths that no longer
+        // exist, failing queries with `NotFound`.
+        let ordered = ordered_oldest_first(&persisted_snapshots);
+
+        let files = ordered.into_iter().fold(
             hashbrown::HashMap::new(),
             |mut files, persisted_snapshot| {
                 size_in_mb += as_mb(persisted_snapshot.parquet_size_bytes);
@@ -424,7 +433,7 @@ impl Inner {
     /// Create from checkpoints and additional (newer) snapshots.
     pub(crate) fn new_from_checkpoints_and_snapshots(
         mut checkpoints: Vec<PersistedSnapshotCheckpoint>,
-        additional_snapshots: Vec<PersistedSnapshot>,
+        mut additional_snapshots: Vec<PersistedSnapshot>,
     ) -> Self {
         debug!(
             checkpoint_count = checkpoints.len(),
@@ -444,7 +453,9 @@ impl Inner {
         // Convert merged checkpoint to Inner, or start with empty
         let mut inner = merged_checkpoint.map(Inner::from).unwrap_or_default();
 
-        // Apply additional snapshots
+        // Apply additional snapshots oldest-first: see `ordered_oldest_first`. The caller hands
+        // these over newest-first, and folding in that order resurrects every removed file.
+        additional_snapshots.sort_by_key(|s| s.snapshot_sequence_number);
         for snapshot in additional_snapshots {
             inner.add_persisted_snapshot(snapshot);
         }
@@ -610,6 +621,21 @@ impl From<PersistedSnapshotCheckpoint> for Inner {
 fn as_mb(bytes: u64) -> f64 {
     let factor = (1_000 * 1_000) as f64;
     bytes as f64 / factor
+}
+
+/// Borrows the snapshots in ascending sequence order, so a fold applies each snapshot's additions
+/// before any later snapshot's removals cancel them.
+///
+/// Startup loads snapshots newest-first, which is right for reading the newest sequence numbers
+/// but wrong for replaying history: `removed_files` names files that older snapshots added, and a
+/// removal applied first matches nothing and is dropped. The file then returns when the older
+/// snapshot is folded in. Compaction makes this routine — every merge removes its inputs, and the
+/// compactor deletes those objects — so without this a node resurrects deleted paths on every
+/// restart. It also affects retention and hard-delete removals, which take the same field.
+fn ordered_oldest_first(snapshots: &[PersistedSnapshot]) -> Vec<&PersistedSnapshot> {
+    let mut ordered: Vec<&PersistedSnapshot> = snapshots.iter().collect();
+    ordered.sort_by_key(|s| s.snapshot_sequence_number);
+    ordered
 }
 
 /// Merges parquet files from a [`PersistedSnapshot`] into the db/table hierarchy.

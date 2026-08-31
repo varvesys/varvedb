@@ -90,7 +90,7 @@ impl Harness {
 
     fn paths(&self) -> Vec<String> {
         self.index
-            .get_files_filtered(DB, TABLE, &ChunkFilter::default())
+            .get_files_filtered(DB, TABLE, &ChunkFilter::default(), None)
             .into_iter()
             .map(|f| f.path.to_string())
             .collect()

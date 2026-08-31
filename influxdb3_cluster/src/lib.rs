@@ -231,9 +231,16 @@ impl ChunkContainer for ClusterWriteBuffer {
         // Lazy peer-buffer chunks: no RPC happens here, only when DataFusion polls them.
         chunks.extend(self.peer_buffer_chunks(&db_schema, &table_def, filter));
 
-        let peer_parquet =
-            self.file_index
-                .get_files_filtered(db_schema.id, table_def.table_id, filter);
+        // Exclude this node's own files: on `--mode ingest,query` they arrived from `self.inner`
+        // above *and* were published to the shared index by this node's own publisher. Planning
+        // both copies is not merely wasteful — DataFusion rejects a plan that scans one file
+        // twice, so every query over persisted data would fail.
+        let peer_parquet = self.file_index.get_files_filtered(
+            db_schema.id,
+            table_def.table_id,
+            filter,
+            Some(&self.node_id),
+        );
 
         if peer_parquet.is_empty() {
             return Ok(chunks);

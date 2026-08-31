@@ -637,3 +637,64 @@ fn test_apply_compaction_is_idempotent() {
     assert_eq!(file_count, 1, "same path must not be counted twice");
     assert_eq!(row_count, 30);
 }
+
+/// Startup loads snapshots **newest-first**, but a snapshot's `removed_files` names files that
+/// *earlier* snapshots added. Folding in load order applies the removal first, where it matches
+/// nothing and is silently dropped, and the older snapshot then re-adds the file. Every compacted
+/// input comes back — and the compactor has already deleted those objects, so the node serves
+/// paths that do not exist and queries fail with `NotFound`.
+///
+/// Reproduced live: a node restarting after compaction resurrected all 19 of its removed inputs.
+#[test_log::test(test)]
+fn removals_survive_snapshots_loaded_newest_first() {
+    // Explicit ids, not `ParquetFileId::new()`: that mints from a global counter, and
+    // `next_id_is_correct_number` and `new_snapshots_use_correct_sequence` assert on its exact
+    // value, so a test that consumes ids fails them when the suite runs in parallel.
+    let parquet = |id: u64, name: &str| ParquetFile {
+        id: ParquetFileId::from(id),
+        path: format!("/random/path/{name}.parquet").into(),
+        size_bytes: 50_000,
+        row_count: 10,
+        chunk_time: 10,
+        min_time: 10,
+        max_time: 200,
+    };
+    let inputs: Vec<ParquetFile> = (0..3).map(|i| parquet(900 + i, &format!("input_{i}"))).collect();
+    let merged = vec![parquet(910, "merged_0")];
+
+    // seq 1..3: one input each, the way ordinary persistence writes them.
+    let adds: Vec<PersistedSnapshot> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| build_snapshot(vec![f.clone()], i as u64 + 1, i as u64 + 1, 1))
+        .collect();
+
+    // seq 4: the compaction swap — adds the merged file, removes all three inputs.
+    let mut swap = build_snapshot(merged.clone(), 4, 4, 1);
+    swap.removed_files = build_snapshot(inputs.clone(), 4, 4, 1).databases;
+
+    // Hand them over newest-first, exactly as `load_snapshots` returns them.
+    let mut newest_first = vec![swap];
+    newest_first.extend(adds.into_iter().rev());
+    assert_eq!(
+        newest_first
+            .iter()
+            .map(|s| s.snapshot_sequence_number.as_u64())
+            .collect::<Vec<_>>(),
+        vec![4, 3, 2, 1],
+        "the fixture must be newest-first, or it does not test the bug"
+    );
+
+    for persisted in [
+        PersistedFiles::new_from_persisted_snapshots(None, Arc::new(newest_first.clone())),
+        PersistedFiles::new_from_checkpoints_and_snapshots(None, vec![], newest_first),
+    ] {
+        let files = persisted.get_files(DbId::from(0), TableId::from(0));
+        let paths: Vec<String> = files.iter().map(|f| f.path.to_string()).collect();
+        assert_eq!(
+            paths,
+            vec![merged[0].path.to_string()],
+            "compacted-away inputs must stay removed; they no longer exist in object store"
+        );
+    }
+}

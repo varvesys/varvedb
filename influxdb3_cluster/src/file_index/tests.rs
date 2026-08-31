@@ -43,10 +43,48 @@ fn entry(seq: u64, deltas: Vec<FileIndexDelta>) -> FileIndexLogEntry {
 
 fn paths(index: &FileIndex) -> Vec<String> {
     index
-        .get_files_filtered(DB, TABLE, &ChunkFilter::default())
+        .get_files_filtered(DB, TABLE, &ChunkFilter::default(), None)
         .into_iter()
         .map(|f| f.path.to_string())
         .collect()
+}
+
+/// A node running `--mode ingest,query` publishes its own Parquet into the shared index and also
+/// reads those files locally from `PersistedFiles`. The query path must therefore exclude itself,
+/// or it plans every one of its own files twice — which DataFusion rejects outright ("should not
+/// be rescanning the same file"), failing every query over persisted data on a combined-mode node.
+#[test]
+fn excluded_node_is_dropped_from_the_result() {
+    let index = FileIndex::default();
+    index.apply(&entry(
+        1,
+        vec![
+            delta("self01", vec![file(1, "self01/a.parquet", 0, 10)], vec![]),
+            delta("peer02", vec![file(2, "peer02/b.parquet", 0, 10)], vec![]),
+        ],
+    ));
+
+    let all = index.get_files_filtered(DB, TABLE, &ChunkFilter::default(), None);
+    assert_eq!(all.len(), 2, "without an exclusion both nodes' files appear");
+
+    let without_self = index.get_files_filtered(DB, TABLE, &ChunkFilter::default(), Some("self01"));
+    assert_eq!(
+        without_self
+            .iter()
+            .map(|f| f.path.to_string())
+            .collect::<Vec<_>>(),
+        vec!["peer02/b.parquet"],
+        "the excluded node's files must not be planned a second time"
+    );
+
+    // Excluding a node that holds nothing is a no-op, not an error: a querier-only node has no
+    // files of its own in the index and must still see every peer's.
+    assert_eq!(
+        index
+            .get_files_filtered(DB, TABLE, &ChunkFilter::default(), Some("querier03"))
+            .len(),
+        2
+    );
 }
 
 fn log() -> (FileIndexLog, Arc<dyn ObjectStore>) {
@@ -244,7 +282,7 @@ fn assigned_chunk_order_favours_the_later_publication() {
 
     // Mirrors `ClusterWriteBuffer::get_table_chunks`: ascending counter zipped over the slice.
     let orders: Vec<(String, i64)> = (0i64..)
-        .zip(index.get_files_filtered(DB, TABLE, &ChunkFilter::default()))
+        .zip(index.get_files_filtered(DB, TABLE, &ChunkFilter::default(), None))
         .map(|(order, f)| (f.path.to_string(), order))
         .collect();
 
@@ -289,7 +327,7 @@ fn time_filter_prunes_non_overlapping_files() {
 
     let mut filter = ChunkFilter::default();
     filter.time_lower_bound_ns = Some(500);
-    let got = index.get_files_filtered(DB, TABLE, &filter);
+    let got = index.get_files_filtered(DB, TABLE, &filter, None);
     assert_eq!(got.len(), 1);
     assert_eq!(&*got[0].path, "host01/late.parquet");
 }

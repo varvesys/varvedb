@@ -237,6 +237,14 @@ impl FileIndex {
 
     /// Every file for a table, across all nodes, overlapping the filter's time bounds.
     ///
+    /// `exclude_node` drops one node's files from the result. The query path passes its **own**
+    /// node id: a node running `--mode ingest,query` publishes its Parquet into the shared index
+    /// like any ingester, but already gets those same files locally from its `PersistedFiles`.
+    /// Without the exclusion each one is planned twice, and DataFusion rejects the plan outright
+    /// with *"should not be rescanning the same file"* rather than merely deduplicating it — so
+    /// on a combined-mode node every query over persisted data fails. `peer_buffer_chunks` skips
+    /// self for the same reason; this is the Parquet half of that rule.
+    ///
     /// Ordered by `added_at` **ascending**, so a caller assigning `ChunkOrder` positionally from
     /// an increasing counter gives the most recently published file the **highest** order — and
     /// higher order wins deduplication (`ChunkOrder`'s own doc: *"chunks with higher order
@@ -253,11 +261,14 @@ impl FileIndex {
         db_id: DbId,
         table_id: TableId,
         filter: &ChunkFilter<'_>,
+        exclude_node: Option<&str>,
     ) -> Vec<ParquetFile> {
         let inner = self.inner.read();
         let mut out: Vec<&IndexedFile> = inner
             .nodes
-            .values()
+            .iter()
+            .filter(|(node_id, _)| exclude_node != Some(node_id.as_ref()))
+            .map(|(_, dbs)| dbs)
             .filter_map(|dbs| dbs.get(&db_id))
             .filter_map(|tables| tables.get(&table_id))
             .flatten()
