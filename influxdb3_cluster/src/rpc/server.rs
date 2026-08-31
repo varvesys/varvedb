@@ -21,7 +21,9 @@ use influxdb3_id::ParquetFileId;
 use influxdb3_shutdown::ShutdownToken;
 use influxdb3_write::persister::Persister;
 use influxdb3_write::write_buffer::WriteBufferImpl;
-use influxdb3_write::{ChunkFilter, DatabaseTables, PersistedSnapshot, PersistedSnapshotVersion};
+use influxdb3_write::{
+    ChunkFilter, DatabaseTables, ParquetFile, PersistedSnapshot, PersistedSnapshotVersion,
+};
 use observability_deps::tracing::{debug, error, info, warn};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -42,6 +44,8 @@ pub struct PeerChunkService {
     /// Number of `do_get` calls served. Used by tests to assert that queriers skip peers they can
     /// prove hold nothing relevant.
     requests: Arc<AtomicU64>,
+    /// Reads this node's own Parquet when a reader asks for files it cannot know about.
+    executor: Option<Arc<iox_query::exec::Executor>>,
     /// The shared index, used only to report how far *this* node has published.
     ///
     /// Reporting our own watermark is what lets a caller tell an empty buffer from rows that have
@@ -62,8 +66,18 @@ impl PeerChunkService {
             node_id,
             persister,
             requests: Arc::new(AtomicU64::new(0)),
+            executor: None,
             file_index: None,
         }
+    }
+
+    /// Attach an executor so this node can materialise its own Parquet for a lagging reader.
+    ///
+    /// Without one, the peer answers with buffered rows only — correct, but it cannot close the
+    /// handoff window.
+    pub fn with_executor(mut self, executor: Arc<iox_query::exec::Executor>) -> Self {
+        self.executor = Some(executor);
+        self
     }
 
     /// Attach the shared index so this node can report its own publish watermark.
@@ -198,10 +212,7 @@ impl PeerChunkService {
     ///
     /// Deliberately reads only `WriteBufferImpl::buffer()`, never `get_table_chunks` — peers index
     /// each other's Parquet separately, so returning persisted data here would double-count.
-    fn buffer_batches(
-        &self,
-        ticket: &PeerChunkTicket,
-    ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>), Status> {
+    fn buffer_batches(&self, ticket: &PeerChunkTicket) -> Result<BufferAnswer, Status> {
         let db_id = ticket.db_id();
         let table_id = ticket.table_id();
 
@@ -227,7 +238,12 @@ impl PeerChunkService {
         // Reading both under the single buffer guard this method holds is also the safer shape.
         // Its own doc notes that a persist job swaps chunks and files under one write guard, so
         // reading them separately can return the snapshotted rows twice.
-        let (chunks, _persisted_files) = self
+        //
+        // Both halves are used now. The buffer answers for rows not yet persisted; `persisted_files`
+        // answers for the narrow set the reader cannot know about yet. Reading them under the same
+        // guard is what makes the pair consistent — a persist job moving a chunk to a file between
+        // the two reads would otherwise be counted twice or not at all.
+        let (chunks, persisted_files) = self
             .write_buffer
             .buffer()
             .get_table_chunks_and_parquet_files(
@@ -240,6 +256,39 @@ impl PeerChunkService {
                 &NoopSession,
             )
             .map_err(|e| Status::internal(format!("failed to read local buffer: {e}")))?;
+
+        // Files this reader cannot have heard about: it learns of our files through the shared log,
+        // and a file reaches the log only after its manifest is written — which happens after the
+        // buffer chunk covering it was already dropped. In that window the rows are in neither the
+        // reader's index nor our buffer, so nobody would return them.
+        //
+        // Filtering on the `id` field, never on position: the stored order is insertion order,
+        // which concurrent persist jobs, compaction appends and restart rebuilds all disturb. The
+        // ids stay monotonic regardless.
+        let unseen: Vec<ParquetFile> = match ticket.since_file_id() {
+            Some(since) => persisted_files
+                .into_iter()
+                .filter(|f| f.id > since)
+                .collect(),
+
+            // No watermark means the reader holds no file of ours for this table, so it also
+            // planned no Parquet for us — nothing else in the query will cover these rows. Send
+            // them all rather than leave them in no source at all. This is the first persist of a
+            // (peer, db, table) pair, where there is no earlier file to derive a watermark from.
+            //
+            // Note what this does to ordering. Everything returned here reaches the reader as
+            // `RecordBatchesExec` output carrying `PEER_BUFFER_CHUNK_ORDER`, which outranks every
+            // Parquet chunk. For the intended case — a few files persisted moments ago — that is
+            // right: those rows were in this buffer until just now and would have carried that
+            // order anyway.
+            //
+            // A cold-started reader also arrives with no watermark, and then this returns our whole
+            // history for the table at that same order, so our older rows can beat another node's
+            // newer Parquet on a primary-key conflict. That only bites where one series is written
+            // to several nodes, and it ends as soon as the reader's first sync gives it a real
+            // watermark.
+            None => persisted_files,
+        };
 
         // Buffer chunks are always in-memory record batches.
         let mut batches = Vec::new();
@@ -260,8 +309,81 @@ impl PeerChunkService {
             }
         }
 
-        Ok((arrow_schema, batches))
+        Ok(BufferAnswer {
+            schema: arrow_schema,
+            batches,
+            unseen,
+            table_def,
+        })
     }
+
+    /// Materialise this node's own Parquet files into record batches.
+    ///
+    /// Only ever called for the handful of files a reader cannot yet know about, so the common
+    /// case is an empty list and no work at all. Mirrors the compactor's read path
+    /// (`compactor.rs:411-441`): build chunks with the query path's own constructor, then let
+    /// `ReorgPlanner` sort and deduplicate them.
+    async fn parquet_batches(
+        &self,
+        table_def: &Arc<influxdb3_catalog::catalog::TableDefinition>,
+        files: &[ParquetFile],
+    ) -> Result<Vec<arrow::array::RecordBatch>, Status> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(executor) = self.executor.as_ref() else {
+            // Without an executor this node cannot read its own Parquet. The buffer half is still
+            // correct, so degrade rather than fail the reader's query.
+            warn!(
+                files = files.len(),
+                "no executor; cannot serve files the reader has not seen"
+            );
+            return Ok(Vec::new());
+        };
+
+        let chunks: Vec<Arc<dyn iox_query::QueryChunk>> = files
+            .iter()
+            .enumerate()
+            .map(|(order, file)| {
+                Arc::new(influxdb3_write::write_buffer::parquet_chunk_from_file(
+                    file,
+                    &table_def.schema,
+                    self.persister.object_store_url().clone(),
+                    self.persister.object_store(),
+                    order as i64,
+                )) as Arc<dyn iox_query::QueryChunk>
+            })
+            .collect();
+
+        let logical_plan = iox_query::frontend::reorg::ReorgPlanner::new()
+            .compact_plan(
+                data_types::TableId::new(0),
+                Arc::clone(&table_def.table_name),
+                &table_def.schema,
+                chunks,
+                table_def.sort_key.clone(),
+            )
+            .map_err(|e| Status::internal(format!("failed to plan unseen-file read: {e}")))?;
+
+        let ctx = executor.new_context();
+        let physical_plan = ctx
+            .create_physical_plan(&logical_plan)
+            .await
+            .map_err(|e| Status::internal(format!("failed to plan unseen-file read: {e}")))?;
+        ctx.collect(physical_plan)
+            .await
+            .map_err(|e| Status::internal(format!("failed to read unseen files: {e}")))
+    }
+}
+
+/// What a peer has for one table: its buffered rows, plus the files the asking reader cannot yet
+/// know about.
+struct BufferAnswer {
+    schema: arrow::datatypes::SchemaRef,
+    batches: Vec<arrow::array::RecordBatch>,
+    /// Files with an id above the reader's watermark. Empty whenever it is caught up.
+    unseen: Vec<ParquetFile>,
+    table_def: Arc<influxdb3_catalog::catalog::TableDefinition>,
 }
 
 /// The buffer's `get_table_chunks` takes a `&dyn Session` but only uses it for tracing spans in the
@@ -359,7 +481,32 @@ impl FlightService for PeerChunkService {
 
         debug!(?ticket, "serving peer chunk request");
 
-        let (schema, batches) = self.buffer_batches(&ticket)?;
+        let BufferAnswer {
+            schema,
+            mut batches,
+            unseen,
+            table_def,
+        } = self.buffer_batches(&ticket)?;
+
+        // Rows from files this reader cannot know about yet. Empty whenever it is caught up, which
+        // is the normal case, so this costs nothing in steady state.
+        //
+        // They ride back as record batches alongside the buffered rows, and so arrive at the
+        // reader carrying `PEER_BUFFER_CHUNK_ORDER`. That is not a new ordering claim: these rows
+        // were in this node's buffer moments ago and would have been served at exactly that order
+        // had the query arrived slightly sooner. This preserves the order they already had across
+        // the handoff rather than inventing one.
+        let unseen_count = unseen.len();
+        let unseen_batches = self.parquet_batches(&table_def, &unseen).await?;
+        if unseen_count > 0 {
+            debug!(
+                files = unseen_count,
+                batches = unseen_batches.len(),
+                since = ?ticket.since_file_id(),
+                "served files the reader had not seen"
+            );
+        }
+        batches.extend(unseen_batches);
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         debug!(
             batches = batches.len(),

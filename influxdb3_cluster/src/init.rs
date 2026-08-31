@@ -118,7 +118,8 @@ pub fn wrap_write_buffer(
                 Arc::clone(identity.node_id()),
                 Arc::clone(&persister),
             )
-            .with_file_index(Some(Arc::clone(&file_index))),
+            .with_file_index(Some(Arc::clone(&file_index)))
+            .with_executor(Arc::clone(&executor)),
             shutdown_manager.register("cluster_peer_rpc"),
         );
     } else {

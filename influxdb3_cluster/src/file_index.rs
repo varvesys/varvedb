@@ -463,3 +463,34 @@ pub struct FileIndexSnapshot {
 
 #[cfg(test)]
 mod tests;
+
+impl FileIndex {
+    /// Highest `ParquetFileId` this index holds for one node's table.
+    ///
+    /// Sent to that peer so it can answer with the rows from any file it has *above* this — the
+    /// files it has persisted but which have not yet reached this reader through the log.
+    ///
+    /// Scoped per table on purpose. `ParquetFileId` is allocated from one counter per node, across
+    /// every database and table, so a high id in a busy table would otherwise mask a lower one
+    /// here and hide exactly the rows this is meant to recover.
+    ///
+    /// Reads the `id` **field** of each entry rather than relying on position: the stored order is
+    /// insertion order, which concurrent persist jobs, compaction appends and restart rebuilds all
+    /// disturb. The ids themselves stay monotonic regardless.
+    pub fn max_file_id(
+        &self,
+        node_id: &str,
+        db_id: DbId,
+        table_id: TableId,
+    ) -> Option<influxdb3_id::ParquetFileId> {
+        let inner = self.inner.read();
+        inner
+            .nodes
+            .get(node_id)?
+            .get(&db_id)?
+            .get(&table_id)?
+            .iter()
+            .map(|indexed| indexed.file.id)
+            .max()
+    }
+}

@@ -22,7 +22,7 @@ fn chunk(addr: &str) -> PeerBufferChunk {
     PeerBufferChunk::new(
         Arc::from(addr),
         Arc::new(PeerClients::new()),
-        PeerChunkTicket::new(DbId::new(1), TableId::new(0), None, None),
+        PeerChunkTicket::new(DbId::new(1), TableId::new(0), None, None, None),
         test_schema(),
         PartitionHashId::new(
             data_types::TableId::new(0),

@@ -849,3 +849,196 @@ async fn a_caught_up_reader_does_not_reload_the_snapshot() {
     assert_eq!(reader_log.sync(&reader).await.unwrap(), 1);
     assert_eq!(paths(&reader), paths(&writer));
 }
+
+// ---- reader watermark for the handoff gap ----
+
+#[test]
+fn max_file_id_reports_the_highest_id_for_that_table() {
+    let index = FileIndex::new();
+    index.apply(&entry(
+        1,
+        vec![delta(
+            "host01",
+            vec![
+                file(7, "host01/a.parquet", 0, 10),
+                file(19, "host01/b.parquet", 0, 10),
+                file(11, "host01/c.parquet", 0, 10),
+            ],
+            vec![],
+        )],
+    ));
+
+    assert_eq!(
+        index.max_file_id("host01", DB, TABLE),
+        Some(ParquetFileId::from(19)),
+        "the max is taken from the id field, not from insertion order"
+    );
+}
+
+#[test]
+fn max_file_id_is_scoped_per_table() {
+    // ParquetFileId comes from ONE counter per node, spanning every database and table. A high id
+    // in a busy table must not mask a lower one here, or the peer would skip exactly the files
+    // this is meant to recover.
+    const OTHER_TABLE: TableId = TableId::new(1);
+
+    let index = FileIndex::new();
+    index.apply(&FileIndexLogEntry {
+        sequence: FileIndexSequence::new(1),
+        deltas: vec![
+            FileIndexDelta {
+                node_id: "host01".into(),
+                db_id: DB,
+                table_id: TABLE,
+                snapshot_sequence: SnapshotSequenceNumber::new(1),
+                added: vec![file(5, "host01/low.parquet", 0, 10)],
+                removed: vec![],
+            },
+            FileIndexDelta {
+                node_id: "host01".into(),
+                db_id: DB,
+                table_id: OTHER_TABLE,
+                snapshot_sequence: SnapshotSequenceNumber::new(1),
+                added: vec![file(900, "host01/high.parquet", 0, 10)],
+                removed: vec![],
+            },
+        ],
+    });
+
+    assert_eq!(
+        index.max_file_id("host01", DB, TABLE),
+        Some(ParquetFileId::from(5)),
+        "the busy table's id 900 must not raise this table's watermark"
+    );
+}
+
+#[test]
+fn max_file_id_is_none_for_an_unseen_peer_or_table() {
+    // None means "no claim". The peer must read it as "send the buffer only" — reading it as zero
+    // would ask it to ship every file it holds.
+    let index = FileIndex::new();
+    index.apply(&entry(
+        1,
+        vec![delta(
+            "host01",
+            vec![file(1, "host01/a.parquet", 0, 10)],
+            vec![],
+        )],
+    ));
+
+    assert_eq!(index.max_file_id("host02", DB, TABLE), None);
+    assert_eq!(index.max_file_id("host01", DbId::new(99), TABLE), None);
+    assert_eq!(index.max_file_id("host01", DB, TableId::new(99)), None);
+}
+
+#[test]
+fn the_watermark_excludes_exactly_what_the_reader_already_has() {
+    // The disjointness the design rests on: the reader plans files <= N from its own index, the
+    // peer sends rows from files > N. Overlap would double-count; a gap would lose rows.
+    let index = FileIndex::new();
+    index.apply(&entry(
+        1,
+        vec![delta(
+            "host01",
+            vec![
+                file(10, "host01/a.parquet", 0, 10),
+                file(11, "host01/b.parquet", 0, 10),
+            ],
+            vec![],
+        )],
+    ));
+
+    let watermark = index.max_file_id("host01", DB, TABLE).unwrap();
+
+    // What the peer would hold, including two files not yet published to the log.
+    let peer_files = [
+        file(10, "host01/a.parquet", 0, 10),
+        file(11, "host01/b.parquet", 0, 10),
+        file(12, "host01/c.parquet", 0, 10),
+        file(13, "host01/d.parquet", 0, 10),
+    ];
+    let would_send: Vec<&str> = peer_files
+        .iter()
+        .filter(|f| f.id > watermark)
+        .map(|f| &*f.path)
+        .collect();
+
+    assert_eq!(
+        would_send,
+        vec!["host01/c.parquet", "host01/d.parquet"],
+        "only the files above the reader's watermark"
+    );
+}
+
+#[test]
+fn no_watermark_means_the_peer_sends_everything_it_has() {
+    // The first persist of a (peer, db, table) pair. The reader has no file for it, so it derives
+    // no watermark AND plans no Parquet for that peer — nothing else in the query covers these
+    // rows. The peer must send all of them, not none.
+    let index = FileIndex::new();
+    index.apply(&entry(
+        1,
+        vec![delta(
+            "host01",
+            vec![file(1, "host01/a.parquet", 0, 10)],
+            vec![],
+        )],
+    ));
+
+    // A different peer this reader has never seen a file from.
+    let watermark = index.max_file_id("host02", DB, TABLE);
+    assert_eq!(watermark, None);
+
+    let peer_files = [
+        file(3, "host02/x.parquet", 0, 10),
+        file(4, "host02/y.parquet", 0, 10),
+    ];
+    let would_send: Vec<&str> = match watermark {
+        Some(since) => peer_files
+            .iter()
+            .filter(|f| f.id > since)
+            .map(|f| &*f.path)
+            .collect(),
+        None => peer_files.iter().map(|f| &*f.path).collect(),
+    };
+
+    assert_eq!(
+        would_send,
+        vec!["host02/x.parquet", "host02/y.parquet"],
+        "with no watermark the peer sends its whole set for the table"
+    );
+}
+
+#[test]
+fn one_seen_file_switches_the_peer_to_sending_only_newer() {
+    // As soon as the reader holds a single file for the pair, the watermark takes over and the
+    // peer stops resending history. This is the transition out of the cold case above.
+    let index = FileIndex::new();
+    index.apply(&entry(
+        1,
+        vec![delta(
+            "host02",
+            vec![file(3, "host02/x.parquet", 0, 10)],
+            vec![],
+        )],
+    ));
+
+    let watermark = index.max_file_id("host02", DB, TABLE);
+    assert_eq!(watermark, Some(ParquetFileId::from(3)));
+
+    let peer_files = [
+        file(3, "host02/x.parquet", 0, 10),
+        file(4, "host02/y.parquet", 0, 10),
+    ];
+    let would_send: Vec<&str> = peer_files
+        .iter()
+        .filter(|f| f.id > watermark.unwrap())
+        .map(|f| &*f.path)
+        .collect();
+
+    assert_eq!(
+        would_send,
+        vec!["host02/y.parquet"],
+        "the already-seen file must not be resent; the reader plans it from its own index"
+    );
+}

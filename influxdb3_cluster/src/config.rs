@@ -97,7 +97,7 @@ pub struct ClusterConfig {
     #[clap(
         long = "file-index-sync-interval",
         visible_alias = "peer-sync-interval",
-        env = "INFLUXDB3_PEER_SYNC_INTERVAL",
+        env = "INFLUXDB3_FILE_INDEX_SYNC_INTERVAL",
         default_value = "5s",
         action
     )]

@@ -173,11 +173,20 @@ impl ClusterWriteBuffer {
                 continue;
             }
 
+            // Tell the peer what we already have, so it can send the rows from anything newer.
+            // Those files exist on the peer but cannot have reached us yet: a file enters the
+            // shared log only after its manifest is written, which is after the buffer chunk
+            // covering it was dropped. Without this the rows are in neither source.
+            let since_file_id =
+                self.file_index
+                    .max_file_id(&peer_id, db_schema.id, table_def.table_id);
+
             let ticket = PeerChunkTicket::new(
                 db_schema.id,
                 table_def.table_id,
                 filter.time_lower_bound_ns,
                 filter.time_upper_bound_ns,
+                since_file_id,
             );
             // Peer buffer rows span whatever gen1 windows the peer holds, so they get their own
             // partition key rather than being attributed to one window.
