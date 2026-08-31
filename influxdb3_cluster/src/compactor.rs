@@ -1,4 +1,4 @@
-//! Merging of small, cold Parquet files belonging to ingest-only peers.
+//! Merging of small, cold Parquet files belonging to ingesting peers.
 //!
 //! # Why this exists
 //!
@@ -247,27 +247,37 @@ pub fn select_merges(
 
 /// Whether this peer's files may be rewritten by a remote compactor.
 ///
-/// A node that serves queries answers them from its own in-memory `PersistedFiles`, which no
-/// compaction notice can be guaranteed to reach in time — if the notice is lost the node keeps
-/// naming input files until it restarts, and once the grace period expires those reads fail. A node
-/// that only ingests never dereferences that list, so a lost notice costs nothing but stale
-/// metrics.
+/// Any node that ingests qualifies, including one that also serves queries. What keeps a target's
+/// inputs safe is not its role but the order the merge commits in:
 ///
-/// A peer already carrying `Compact` is skipped as well, so compactors never rewrite each other's
-/// files. Note this says nothing about two compactors converging on a *third* node's prefix — see
-/// the module header on why exactly one compactor may run.
+/// * **The acknowledgement gates deletion.** [`compact_group`] calls `notify_owner(...).await?`, so
+///   a notice that does not land returns early and the inputs are never scheduled for reclamation.
+/// * **The acknowledgement implies durability.** The handler applies the swap and then persists a
+///   snapshot, returning an error if that write fails — precisely so a compactor never deletes
+///   inputs the owner could lose on restart.
+/// * **`--compact-input-grace` covers the rest.** A query that resolved the old paths before the
+///   swap keeps reading them for the grace period, which must exceed the longest query the cluster
+///   runs. That hazard belongs to every node, not to query-serving ones.
+///
+/// An earlier version excluded query-serving peers, reasoning that a lost notice would leave such a
+/// node naming inputs until the grace period deleted them under it. The first bullet above makes
+/// that unreachable: no acknowledgement, no deletion. Notice loss is equally likely against an
+/// ingest-only node in any case — only the imagined consequence differed.
+///
+/// A peer already carrying `Compact` is still skipped, so compactors never rewrite each other's
+/// files. That says nothing about two compactors converging on a *third* node's prefix — see the
+/// module header on why exactly one compactor may run.
 fn is_compactable(modes: &[NodeMode]) -> bool {
     let ingests = modes.iter().any(|m| matches!(m, NodeMode::Ingest));
-    let serves_queries = modes
-        .iter()
-        .any(|m| matches!(m, NodeMode::Query | NodeMode::Core | NodeMode::All));
     let compacts = modes.iter().any(|m| matches!(m, NodeMode::Compact));
-    ingests && !serves_queries && !compacts
+    ingests && !compacts
 }
 
 /// Everything the compaction loop needs.
 pub struct CompactorArgs {
     pub node_id: Arc<str>,
+    /// Cluster prefix, so the pending-deletion queue outlives any one compactor process.
+    pub cluster_id: Arc<str>,
     pub config: CompactionConfig,
     pub catalog: Arc<Catalog>,
     /// The same index the queriers read, so the compactor can never merge a file set the readers
@@ -305,7 +315,12 @@ pub fn spawn_compactor(args: CompactorArgs, shutdown: ShutdownToken) {
             Arc::clone(&args.persister),
             Arc::clone(&args.time_provider),
             args.config.input_grace.into(),
+            Arc::clone(&args.cluster_id),
         );
+        // Pick up what a previous compactor process owed. Without this the queue starts empty and
+        // every file it had scheduled leaks, since the owner dropped them from its `PersistedFiles`
+        // when it acknowledged the merge.
+        deleter.load().await;
 
         loop {
             let next = args.time_provider.now() + interval;
@@ -339,7 +354,10 @@ async fn compact_once(args: &CompactorArgs, deleter: &InputDeleter) {
     if peers.is_empty() {
         // Worth saying out loud: a compact-only node whose peers all serve queries has nothing it
         // may safely touch, and would otherwise look identical to one that is simply idle.
-        debug!("no compactable peers; every peer either serves queries or compacts its own files");
+        // Warn rather than debug: a node started in `compact` mode with nothing to work on is
+        // almost always a misconfiguration, and at default log levels a `debug!` here is
+        // indistinguishable from a healthy idle compactor.
+        warn!("no compactable peers; no registered peer ingests without also compacting");
         return;
     }
 
@@ -364,7 +382,7 @@ async fn compact_once(args: &CompactorArgs, deleter: &InputDeleter) {
                             output_rows = outcome.merged.row_count,
                             "compacted files"
                         );
-                        deleter.schedule(&peer, &group.inputs);
+                        deleter.schedule(&peer, &group.inputs).await;
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -567,7 +585,19 @@ struct InputDeleter {
     persister: Arc<Persister>,
     time_provider: Arc<dyn TimeProvider>,
     grace: Duration,
-    pending: parking_lot::Mutex<Vec<(i64, Arc<str>, String)>>,
+    pending: parking_lot::Mutex<Vec<PendingDeletion>>,
+    /// Cluster prefix for the queue's object-store path.
+    cluster_id: Arc<str>,
+}
+
+/// One input file awaiting reclamation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PendingDeletion {
+    /// Wall-clock nanos after which the file may be deleted.
+    due_ns: i64,
+    /// Object-store prefix of the node that owns the file.
+    peer: Arc<str>,
+    path: String,
 }
 
 impl InputDeleter {
@@ -575,39 +605,136 @@ impl InputDeleter {
         persister: Arc<Persister>,
         time_provider: Arc<dyn TimeProvider>,
         grace: Duration,
+        cluster_id: Arc<str>,
     ) -> Self {
         Self {
             persister,
             time_provider,
             grace,
             pending: parking_lot::Mutex::new(Vec::new()),
+            cluster_id,
         }
     }
 
-    fn schedule(&self, peer: &Arc<str>, inputs: &[ParquetFile]) {
-        let due = self.time_provider.now().timestamp_nanos() + self.grace.as_nanos() as i64;
-        let mut pending = self.pending.lock();
-        for file in inputs {
-            pending.push((due, Arc::clone(peer), file.path.to_string()));
+    /// Where the queue lives.
+    ///
+    /// Under the **cluster** prefix rather than this compactor's own node prefix, so a replacement
+    /// started under a different `--node-id` still finds what its predecessor owed.
+    fn queue_path(&self) -> object_store::path::Path {
+        object_store::path::Path::from(format!(
+            "{}/compactor/pending-deletions.json",
+            self.cluster_id
+        ))
+    }
+
+    /// Read a previous process's queue, if there is one.
+    ///
+    /// Every failure here starts empty rather than guessing. That leaks the objects the lost
+    /// entries named, which is the same outcome as before this queue was durable at all — and it
+    /// stays strictly preferable to acting on a half-read list and deleting a file some query
+    /// still needs.
+    async fn load(&self) {
+        let path = self.queue_path();
+        let bytes = match self.persister.object_store().get(&path).await {
+            Ok(result) => match result.bytes().await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    error!(%error, %path, "could not read pending-deletion queue; starting empty");
+                    return;
+                }
+            },
+            Err(object_store::Error::NotFound { .. }) => {
+                debug!("no pending-deletion queue; starting empty");
+                return;
+            }
+            Err(error) => {
+                error!(%error, %path, "could not open pending-deletion queue; starting empty");
+                return;
+            }
+        };
+
+        match serde_json::from_slice::<Vec<PendingDeletion>>(&bytes) {
+            Ok(loaded) => {
+                // Entries already past due are deleted on the next pass. Safe: they were retired at
+                // least a full grace period ago, so nothing references them any more.
+                info!(
+                    recovered = loaded.len(),
+                    "recovered pending deletions from a previous compactor"
+                );
+                self.pending.lock().extend(loaded);
+            }
+            Err(error) => {
+                error!(%error, %path, "pending-deletion queue is unreadable; starting empty");
+            }
         }
+    }
+
+    /// Overwrite the queue.
+    ///
+    /// A plain PUT, not a compare-and-swap: exactly one compactor may run per cluster, and this is
+    /// that compactor's own state. Two would clobber one another here — last writer wins over a set
+    /// of deletions, which could both resurrect and drop entries — but that is already forbidden by
+    /// the invariant in the module header.
+    ///
+    /// A failed write leaves the in-memory queue intact, so the next pass rewrites it. The cost of
+    /// losing this object is a leak, never a premature delete.
+    async fn save(&self) {
+        let snapshot: Vec<PendingDeletion> = self.pending.lock().clone();
+        let body = match serde_json::to_vec(&snapshot) {
+            Ok(body) => body,
+            Err(error) => {
+                error!(%error, "could not serialise pending deletions");
+                return;
+            }
+        };
+        if let Err(error) = self
+            .persister
+            .object_store()
+            .put(
+                &self.queue_path(),
+                object_store::PutPayload::from_bytes(body.into()),
+            )
+            .await
+        {
+            error!(%error, "could not persist pending deletions; they survive only in memory");
+        }
+    }
+
+    async fn schedule(&self, peer: &Arc<str>, inputs: &[ParquetFile]) {
+        let due_ns = self.time_provider.now().timestamp_nanos() + self.grace.as_nanos() as i64;
+        {
+            let mut pending = self.pending.lock();
+            for file in inputs {
+                pending.push(PendingDeletion {
+                    due_ns,
+                    peer: Arc::clone(peer),
+                    path: file.path.to_string(),
+                });
+            }
+        }
+        self.save().await;
     }
 
     /// Delete everything whose grace period has elapsed.
     ///
-    /// This queue lives only in memory: a compactor that restarts forgets what it owed. The cost of
-    /// that is an orphaned object, not lost or unreadable data — the file is already absent from
-    /// every index, so nothing will ever read it again. Losing the queue is strictly preferable to
-    /// the alternative failure, which would be deleting a file some query still needs.
+    /// The queue is persisted, so a compactor that restarts still owes what it owed. It was
+    /// in-memory once, and a restart inside the grace window then leaked every scheduled file —
+    /// permanently, because the owner drops them from its `PersistedFiles` the moment it
+    /// acknowledges the merge, so nothing else tracks them.
+    ///
+    /// Durability does not change the safety bias. Every failure path here and in [`Self::load`]
+    /// prefers leaking an object to deleting one early: the leaked file is already absent from
+    /// every index, so nothing will ever read it, whereas an early delete breaks a live query.
     async fn reclaim_due(&self) {
         let now = self.time_provider.now().timestamp_nanos();
         let due: Vec<(Arc<str>, String)> = {
             let mut pending = self.pending.lock();
             let (ready, waiting): (Vec<_>, Vec<_>) =
-                pending.drain(..).partition(|(due, _, _)| *due <= now);
+                pending.drain(..).partition(|entry| entry.due_ns <= now);
             *pending = waiting;
             ready
                 .into_iter()
-                .map(|(_, peer, path)| (peer, path))
+                .map(|entry| (entry.peer, entry.path))
                 .collect()
         };
 
@@ -631,6 +758,8 @@ impl InputDeleter {
         if deleted > 0 {
             debug!(deleted, "reclaimed compacted-away input files");
         }
+        // Record the shorter queue, so a restart does not retry what is already gone.
+        self.save().await;
     }
 }
 

@@ -154,6 +154,7 @@ pub fn wrap_write_buffer(
         crate::compactor::spawn_compactor(
             crate::compactor::CompactorArgs {
                 node_id: Arc::clone(identity.node_id()),
+                cluster_id: Arc::clone(identity.cluster_id()),
                 config: *identity.compaction(),
                 catalog: Arc::clone(&catalog),
                 file_index: Arc::clone(&file_index),

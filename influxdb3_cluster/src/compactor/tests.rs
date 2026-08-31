@@ -131,20 +131,29 @@ fn merge_group_spans_its_inputs() {
 }
 
 #[test]
-fn only_ingest_only_peers_are_compactable() {
+fn ingesting_peers_are_compactable_whether_or_not_they_serve_queries() {
     assert!(is_compactable(&[NodeMode::Ingest]));
 
-    // Serving queries means answering them from an in-memory file list that a lost notice would
-    // leave stale, and stale entries become unreadable once the grace period expires.
-    assert!(!is_compactable(&[NodeMode::Ingest, NodeMode::Query]));
-    assert!(!is_compactable(&[NodeMode::Core]));
-    assert!(!is_compactable(&[NodeMode::All]));
+    // Serving queries is no longer disqualifying. The inputs are protected by the commit order,
+    // not by the target's role: the compactor only schedules deletion after the owner
+    // acknowledges, and the owner only acknowledges after persisting the manifest. A notice that
+    // never lands therefore never leads to a deletion.
+    assert!(is_compactable(&[NodeMode::Ingest, NodeMode::Query]));
 
     // Nothing to compact.
     assert!(!is_compactable(&[NodeMode::Query]));
 
     // Two compactors targeting one prefix would race.
     assert!(!is_compactable(&[NodeMode::Ingest, NodeMode::Compact]));
+
+    // `Core` and `All` fall out as not compactable, but for an unrelated reason: this predicate
+    // matches `NodeMode::Ingest` specifically, and `Core` is its own catalog variant rather than a
+    // union of Ingest and Query. A `--mode core` node does ingest, so on the reasoning above it
+    // ought to qualify — `peer_buffer_chunks` works around the same quirk with an explicit `Core`
+    // arm. Left as-is deliberately: widening it is a separate decision from removing the
+    // query-serving exclusion.
+    assert!(!is_compactable(&[NodeMode::Core]));
+    assert!(!is_compactable(&[NodeMode::All]));
 }
 
 #[test]
@@ -196,4 +205,122 @@ fn output_path_discriminator_distinguishes_different_input_sets() {
         output_path_discriminator(&b),
         "distinct merges must not share an output path"
     );
+}
+
+// ---- the pending-deletion queue survives a restart ----
+
+mod pending_queue {
+    use super::*;
+    use influxdb3_write::persister::Persister;
+    use iox_time::{MockProvider, Time};
+    use object_store::ObjectStore;
+    use object_store::memory::InMemory;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const CLUSTER: &str = "mycluster";
+
+    fn deleter(store: Arc<dyn ObjectStore>, now_ns: i64, grace: Duration) -> InputDeleter {
+        let time: Arc<dyn TimeProvider> =
+            Arc::new(MockProvider::new(Time::from_timestamp_nanos(now_ns)));
+        let persister = Arc::new(Persister::new(store, "cmp01", Arc::clone(&time), None));
+        InputDeleter::new(persister, time, grace, CLUSTER.into())
+    }
+
+    fn inputs(paths: &[&str]) -> Vec<ParquetFile> {
+        paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| ParquetFile {
+                path: (*p).into(),
+                ..file(i as u64 + 1, 100, 10)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_restarted_compactor_still_owes_what_it_scheduled() {
+        // The leak this exists to close. The owner drops these files from its `PersistedFiles` the
+        // moment it acknowledges the merge, so if the compactor forgets them nothing else tracks
+        // them and they occupy storage permanently.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let grace = Duration::from_secs(3600);
+
+        let first = deleter(Arc::clone(&store), 0, grace);
+        first
+            .schedule(
+                &Arc::from("ing01"),
+                &inputs(&["ing01/a.parquet", "ing01/b.parquet"]),
+            )
+            .await;
+
+        // A new process, same cluster prefix, well after the grace has elapsed.
+        let restarted = deleter(Arc::clone(&store), 2 * 3600 * 1_000_000_000, grace);
+        assert_eq!(
+            restarted.pending.lock().len(),
+            0,
+            "starts empty before loading"
+        );
+        restarted.load().await;
+        assert_eq!(
+            restarted.pending.lock().len(),
+            2,
+            "must recover what the previous process owed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaiming_shortens_the_saved_queue() {
+        // Otherwise a restart would retry deletions that already happened — harmless against
+        // object store, but it would keep the queue growing forever.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let grace = Duration::from_secs(60);
+
+        let d = deleter(Arc::clone(&store), 0, grace);
+        d.schedule(&Arc::from("ing01"), &inputs(&["ing01/a.parquet"]))
+            .await;
+
+        // Past due.
+        let later = deleter(Arc::clone(&store), 120 * 1_000_000_000, grace);
+        later.load().await;
+        assert_eq!(later.pending.lock().len(), 1);
+        later.reclaim_due().await;
+        assert_eq!(later.pending.lock().len(), 0);
+
+        // A third process must see the emptied queue, not the original one.
+        let third = deleter(Arc::clone(&store), 240 * 1_000_000_000, grace);
+        third.load().await;
+        assert_eq!(
+            third.pending.lock().len(),
+            0,
+            "the save after reclaim must have landed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_queue_starts_empty_rather_than_failing() {
+        // The safety bias: leaking an object is recoverable, acting on a half-read list is not.
+        // A corrupt queue must never panic or error a compactor into a crash loop.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        store
+            .put(
+                &object_store::path::Path::from("mycluster/compactor/pending-deletions.json"),
+                object_store::PutPayload::from_static(b"{ this is not json"),
+            )
+            .await
+            .unwrap();
+
+        let d = deleter(Arc::clone(&store), 0, Duration::from_secs(60));
+        d.load().await;
+
+        assert_eq!(d.pending.lock().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn no_queue_yet_is_not_an_error() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let d = deleter(store, 0, Duration::from_secs(60));
+        d.load().await;
+        assert_eq!(d.pending.lock().len(), 0);
+    }
 }
