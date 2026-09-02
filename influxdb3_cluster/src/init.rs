@@ -162,6 +162,8 @@ pub fn wrap_write_buffer(
                 executor,
                 time_provider,
                 peer_clients: Arc::new(crate::rpc::client::PeerClients::new()),
+                inner: Arc::clone(&inner),
+                compact_self: identity.is_all(),
             },
             shutdown_manager.register("compactor"),
         );

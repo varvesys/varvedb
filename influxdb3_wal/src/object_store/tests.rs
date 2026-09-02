@@ -777,6 +777,114 @@ async fn test_wal_file_removal_after_snapshot() {
     assert!(object_store.get(&path3).await.ok().is_some());
 }
 
+/// `last_persisted_wal_sequence_number` is the replay watermark: it tracks what a completed
+/// snapshot has persisted, NOT the newest WAL file that exists. Flushing WAL files advances
+/// `last_wal_sequence_number` but must leave the persisted watermark untouched — only
+/// `cleanup_snapshot` moves it. A compaction snapshot stamps its `wal_file_sequence_number` with
+/// this value; stamping the newer one instead makes a restart skip un-persisted WAL files.
+#[test_log::test(tokio::test)]
+async fn last_persisted_wal_sequence_number_only_advances_on_snapshot() {
+    let time_provider: Arc<dyn TimeProvider> =
+        Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let notifier: Arc<dyn WalFileNotifier> = Arc::new(TestNotifier::default());
+    // snapshot_size high enough that plain flushes below never trigger a snapshot themselves.
+    let wal_config = WalConfig {
+        max_write_buffer_size: 100,
+        flush_interval: Duration::from_secs(1),
+        snapshot_size: 10,
+        gen1_duration: Gen1Duration::new_1m(),
+        ..Default::default()
+    };
+    let wal = WalObjectStore::new_without_replay(
+        Arc::clone(&time_provider),
+        Arc::clone(&object_store),
+        "my_host",
+        Arc::clone(&notifier),
+        wal_config,
+        None, // last_wal_sequence_number: node has never persisted a snapshot
+        None, // last_snapshot_sequence_number
+        &[],
+        1,
+        CancellationToken::new(),
+    );
+
+    let write_op = |t: i64| {
+        WalOp::Write(WriteBatch {
+            catalog_sequence: 0,
+            database_id: DbId::from(0),
+            database_name: "db".into(),
+            table_chunks: fx_index_map([(
+                TableId::from(0),
+                TableChunks {
+                    min_time: t,
+                    max_time: t,
+                    chunk_time_to_chunk: HashMap::from([(
+                        0,
+                        TableChunk {
+                            rows: vec![Row {
+                                time: t,
+                                fields: vec![Field {
+                                    id: ColumnId::from(0),
+                                    value: FieldData::Integer(1),
+                                }],
+                            }],
+                        },
+                    )]),
+                },
+            )])
+            .into(),
+            min_time_ns: t,
+            max_time_ns: t,
+        })
+    };
+
+    // Never snapshotted -> watermark is 0: a restart would replay every WAL file.
+    assert_eq!(
+        wal.last_persisted_wal_sequence_number().await,
+        WalFileSequenceNumber::new(0)
+    );
+
+    // Flush three WAL files. The newest-file counter climbs; the persisted watermark does not.
+    for t in 1..=3 {
+        wal.write_ops_unconfirmed(vec![write_op(t)]).await.unwrap();
+        wal.flush_buffer(false).await;
+    }
+    assert_eq!(
+        wal.last_wal_sequence_number().await,
+        WalFileSequenceNumber::new(3),
+        "flushing advances the newest-WAL-file counter"
+    );
+    assert_eq!(
+        wal.last_persisted_wal_sequence_number().await,
+        WalFileSequenceNumber::new(0),
+        "no snapshot has completed, so nothing is persisted: the replay watermark stays at 0"
+    );
+
+    // A completed snapshot that persisted WAL files 1..=2 advances the watermark to 2 — and no
+    // further: file 3 is still only in the WAL.
+    let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+    wal.cleanup_snapshot(
+        SnapshotDetails {
+            snapshot_sequence_number: SnapshotSequenceNumber::new(1),
+            end_time_marker: 10,
+            first_wal_sequence_number: WalFileSequenceNumber::new(1),
+            last_wal_sequence_number: WalFileSequenceNumber::new(2),
+            forced: false,
+        },
+        permit,
+    )
+    .await;
+    assert_eq!(
+        wal.last_persisted_wal_sequence_number().await,
+        WalFileSequenceNumber::new(2)
+    );
+    assert!(
+        wal.last_persisted_wal_sequence_number().await <= wal.last_wal_sequence_number().await,
+        "the replay watermark is never ahead of the newest WAL file"
+    );
+}
+
 #[test_log::test(tokio::test)]
 async fn test_wal_file_removal_after_snapshot_worked_out_example() {
     // Say we snapshot every 5 files, and we always want to keep around at least 10 snapshotted files.

@@ -30,10 +30,11 @@ pub enum ClusterError {
 
 /// The node roles selectable on the command line.
 ///
-/// This mirrors a subset of [`NodeMode`] rather than reusing it directly. `NodeMode` has no
-/// `FromStr` or `clap::ValueEnum` impl, and deriving one on the catalog type would both widen that
-/// crate's API and expose modes this build does not implement — `Process` has no behaviour here,
-/// and a flag that registers a role while doing nothing is worse than no flag.
+/// This mirrors a subset of [`NodeMode`] rather than reusing it directly: `NodeMode` has no
+/// `FromStr` or `clap::ValueEnum` impl, and deriving one on the catalog type would widen that
+/// crate's API. `Process` registers the processing-engine role; the engine itself is built
+/// unconditionally today, so naming the role changes nothing yet but keeps `--mode` honest about
+/// what a node is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum CliNodeMode {
     /// Ingests writes and serves queries — the historical single-node behaviour, and the default.
@@ -47,6 +48,13 @@ pub enum CliNodeMode {
     /// Accepts no writes, serves no queries, and publishes no peer address — the traffic it
     /// generates is one-directional, from this node out to the peers whose files it rewrites.
     Compact,
+    /// Registers the processing-engine role. The engine runs regardless of mode in this build, so
+    /// this currently only records the role in the catalog.
+    Process,
+    /// Runs every role in one process: ingest, query, compact, and process. Like any non-`core`
+    /// mode it requires `--cluster-id`; a lone all-in-one node names its own cluster of one. A
+    /// node in this mode compacts its own Parquet in-process rather than over RPC.
+    All,
 }
 
 impl From<CliNodeMode> for NodeMode {
@@ -56,6 +64,8 @@ impl From<CliNodeMode> for NodeMode {
             CliNodeMode::Ingest => NodeMode::Ingest,
             CliNodeMode::Query => NodeMode::Query,
             CliNodeMode::Compact => NodeMode::Compact,
+            CliNodeMode::Process => NodeMode::Process,
+            CliNodeMode::All => NodeMode::All,
         }
     }
 }
@@ -143,7 +153,10 @@ pub struct ClusterConfig {
     ///
     /// `ingest,query` is equivalent in capability to `core` but registers both roles explicitly.
     /// `compact` merges small, cold Parquet files belonging to ingest-only peers; it neither
-    /// accepts writes nor serves queries. Anything other than `core` requires `--cluster-id`.
+    /// accepts writes nor serves queries. `process` names the processing-engine role, which today
+    /// runs regardless of mode. `all` runs every role in one process and compacts its own files
+    /// in-process. Anything other than `core` requires `--cluster-id`, and `all`, like `core`,
+    /// cannot be combined with other modes.
     #[clap(
         long = "mode",
         env = "INFLUXDB3_MODE",
@@ -294,14 +307,25 @@ fn resolve_modes(requested: &[CliNodeMode], is_clustered: bool) -> Result<Vec<No
         });
     }
 
+    // `All` is a union of every role, so combining it with any of them is redundant at best and
+    // contradictory at worst. Checked before `Compact` below so `all,compact` reports this message.
+    if modes.contains(&CliNodeMode::All) && modes.len() > 1 {
+        return Err(ClusterError::InvalidMode {
+            reason: "'all' already covers every role, so it cannot be combined with other modes"
+                .to_string(),
+        });
+    }
+
     // Compaction is deliberately a dedicated role rather than something folded into an ingester.
     //
     // The reason is not just resource contention. A node's own `PersistedFiles` is an in-memory
     // list of the Parquet it has persisted, and nothing refreshes it from object store while the
-    // process runs. A node that both ingests and compacts would have to keep that list coherent
-    // with its own rewrites through a second path; keeping the roles apart means the compactor
-    // only ever touches prefixes it does not serve from, and the owner learns about the rewrite
-    // through one mechanism — the compaction notice — rather than two.
+    // process runs. A `--mode ingest,compact` node would have to keep that list coherent with its
+    // own rewrites through a second path; keeping those roles apart means the compactor only ever
+    // touches prefixes it does not serve from. `all` is the deliberate exception: it both ingests
+    // and compacts, but applies its own merges through the very same `PersistedFiles::apply_compaction`
+    // path a remote owner uses (`rpc::server::apply_compaction_locally`), so there is exactly one
+    // path, not two.
     if modes.contains(&CliNodeMode::Compact) && modes.len() > 1 {
         return Err(ClusterError::InvalidMode {
             reason:
@@ -387,6 +411,24 @@ impl ClusterIdentity {
         self.modes
             .iter()
             .any(|m| matches!(m, NodeMode::Compact | NodeMode::All))
+    }
+
+    /// Whether this node runs the processing engine as a named role.
+    ///
+    /// Nothing branches on this yet — the engine is constructed regardless of mode — but it keeps
+    /// the predicate set complete alongside [`ingests`](Self::ingests) and friends.
+    pub fn processes(&self) -> bool {
+        self.modes
+            .iter()
+            .any(|m| matches!(m, NodeMode::Process | NodeMode::All))
+    }
+
+    /// Whether this node runs every role in one process (`--mode all`).
+    ///
+    /// The distinguishing effect is that it compacts its **own** Parquet in-process rather than
+    /// handing merges to a peer over RPC.
+    pub fn is_all(&self) -> bool {
+        self.modes.iter().any(|m| matches!(m, NodeMode::All))
     }
 
     /// Tunables for the compaction loop. Meaningful only when [`compacts`](Self::compacts).
@@ -673,5 +715,65 @@ mod tests {
         let identity = config(&[]).resolve("host01").unwrap();
         assert_eq!(identity.catalog_sync_interval(), Duration::from_secs(1));
         assert_eq!(identity.peer_sync_interval(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn all_mode_carries_every_capability() {
+        let identity = config(&["--cluster-id", "c", "--mode", "all"])
+            .resolve("host01")
+            .unwrap();
+        assert_eq!(identity.modes(), vec![NodeMode::All]);
+        assert!(identity.ingests());
+        assert!(identity.queries());
+        assert!(identity.compacts());
+        assert!(identity.processes());
+        assert!(identity.is_all());
+        assert!(identity.is_clustered());
+    }
+
+    #[test]
+    fn all_mode_needs_a_cluster() {
+        // `all` is a non-`core` role like any other: a lone all-in-one node still names its own
+        // cluster of one.
+        let err = config(&["--mode", "all"]).resolve("host01").unwrap_err();
+        assert!(
+            err.to_string().contains("require --cluster-id"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn all_cannot_be_combined_with_other_roles() {
+        for modes in ["all,ingest", "all,query", "all,compact", "core,all"] {
+            let err = config(&["--cluster-id", "c", "--mode", modes])
+                .resolve("host01")
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("invalid --mode"), "{modes}: {msg}");
+            assert!(msg.contains("cannot be combined"), "{modes}: {msg}");
+            // `all,compact` must report the `all` message, not the `compact` one — the `all` check
+            // runs first.
+            if modes == "all,compact" {
+                assert!(msg.contains("'all' already covers every role"), "{modes}: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn process_is_a_named_role_requiring_a_cluster() {
+        let identity = config(&["--cluster-id", "c", "--mode", "process"])
+            .resolve("host01")
+            .unwrap();
+        assert_eq!(identity.modes(), vec![NodeMode::Process]);
+        assert!(identity.processes());
+        assert!(!identity.ingests(), "process alone is not an ingester");
+        assert!(!identity.queries(), "process alone is not a querier");
+        assert!(!identity.compacts(), "process alone is not a compactor");
+
+        let err = config(&["--mode", "process"]).resolve("host01").unwrap_err();
+        assert!(
+            err.to_string().contains("require --cluster-id"),
+            "got: {err}"
+        );
     }
 }

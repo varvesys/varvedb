@@ -10,12 +10,18 @@
 //!
 //! # Why a dedicated role
 //!
-//! A compacting node accepts no writes and serves no queries — [`resolve_modes`] rejects `compact`
-//! combined with anything else. Nothing refreshes a node's `PersistedFiles` from object store while
-//! it runs, so a node that both served queries and rewrote its own files would need a second path
-//! keeping that list coherent. Keeping the roles apart means the compactor only ever touches
-//! prefixes it does not serve from, and the owner finds out through exactly one mechanism: the
-//! [`CompactionNotice`].
+//! A `--mode compact` node accepts no writes and serves no queries — [`resolve_modes`] rejects
+//! `compact` combined with anything else. Nothing refreshes a node's `PersistedFiles` from object
+//! store while it runs, so a `--mode ingest,compact` node would need a second path keeping that list
+//! coherent. Keeping those roles apart means the compactor only ever touches prefixes it does not
+//! serve from, and the owner finds out through exactly one mechanism: the [`CompactionNotice`].
+//!
+//! `--mode all` is the deliberate exception. It compacts its **own** prefix in addition to any
+//! ingesting peers', and applies each self-merge in-process through
+//! [`crate::rpc::server::apply_compaction_locally`] — the very same function the RPC handler runs
+//! for a remote owner — so there is still exactly one path that mutates `PersistedFiles`, not two.
+//! The "exactly one compactor per cluster" invariant below is unchanged: an `all` node is that one
+//! compactor.
 //!
 //! # What one compaction does
 //!
@@ -112,7 +118,7 @@ use influxdb3_wal::WalFileSequenceNumber;
 use influxdb3_write::ParquetFile;
 use influxdb3_write::paths::ParquetFilePath;
 use influxdb3_write::persister::Persister;
-use influxdb3_write::write_buffer::parquet_chunk_from_file;
+use influxdb3_write::write_buffer::{WriteBufferImpl, parquet_chunk_from_file};
 use iox_query::QueryChunk;
 use iox_query::exec::Executor;
 use iox_query::frontend::reorg::ReorgPlanner;
@@ -136,6 +142,9 @@ pub enum CompactorError {
 
     #[error("the owning node did not record the compaction: {0}")]
     Unreachable(String),
+
+    #[error("recording the compaction on this node failed: {0}")]
+    RecordLocal(String),
 }
 
 /// A merge that has been chosen but not yet performed.
@@ -267,10 +276,40 @@ pub fn select_merges(
 /// A peer already carrying `Compact` is still skipped, so compactors never rewrite each other's
 /// files. That says nothing about two compactors converging on a *third* node's prefix — see the
 /// module header on why exactly one compactor may run.
+///
+/// A node running `--mode all` carries `NodeMode::All`, not `Ingest`, so it is never selected by
+/// this predicate — its own files are compacted through a separate, explicit self path in
+/// [`compact_once`] instead, never through here. That keeps this predicate answering only "may a
+/// *remote* compactor rewrite this peer", which is what its every caller assumes.
 fn is_compactable(modes: &[NodeMode]) -> bool {
     let ingests = modes.iter().any(|m| matches!(m, NodeMode::Ingest));
     let compacts = modes.iter().any(|m| matches!(m, NodeMode::Compact));
     ingests && !compacts
+}
+
+/// The prefixes one compaction pass will work on.
+///
+/// Every registered node other than this one whose files a remote compactor may rewrite
+/// ([`is_compactable`]), plus this node itself when `compact_self` is set (`--mode all`). Self is
+/// appended explicitly and last: `is_compactable` deliberately rejects `NodeMode::All` so no *other*
+/// compactor touches an `all` node's files, but the node still compacts its own — and it does so
+/// whether or not its own catalog registration has landed yet.
+fn select_targets(
+    nodes: &[(Arc<str>, Vec<NodeMode>)],
+    self_id: &Arc<str>,
+    compact_self: bool,
+) -> Vec<Arc<str>> {
+    let mut targets: Vec<Arc<str>> = nodes
+        .iter()
+        .filter(|(id, modes)| id != self_id && is_compactable(modes))
+        .map(|(id, _)| Arc::clone(id))
+        .collect();
+
+    if compact_self {
+        targets.push(Arc::clone(self_id));
+    }
+
+    targets
 }
 
 /// Everything the compaction loop needs.
@@ -287,6 +326,12 @@ pub struct CompactorArgs {
     pub executor: Arc<Executor>,
     pub time_provider: Arc<dyn TimeProvider>,
     pub peer_clients: Arc<PeerClients>,
+    /// This node's own write buffer, for applying a self-compaction in-process. Only used when
+    /// `compact_self` is set.
+    pub inner: Arc<WriteBufferImpl>,
+    /// Whether this node also compacts its **own** Parquet, applying each merge in-process via
+    /// [`crate::rpc::server::apply_compaction_locally`] rather than over RPC. Set for `--mode all`.
+    pub compact_self: bool,
 }
 
 impl std::fmt::Debug for CompactorArgs {
@@ -338,41 +383,45 @@ pub fn spawn_compactor(args: CompactorArgs, shutdown: ShutdownToken) {
     });
 }
 
-/// One full pass over every compactable peer.
+/// One full pass over every compactable target.
+///
+/// A target is normally a peer; a `--mode all` node also adds itself, and merges applied to its own
+/// prefix go through [`compact_group`]'s in-process path rather than an RPC to the owner.
 async fn compact_once(args: &CompactorArgs, deleter: &InputDeleter) {
     let cold_before = args.time_provider.now().timestamp_nanos()
         - Duration::from(args.config.min_age).as_nanos() as i64;
 
-    let peers: Vec<Arc<str>> = args
+    let nodes: Vec<(Arc<str>, Vec<NodeMode>)> = args
         .catalog
         .list_nodes()
         .into_iter()
-        .filter(|n| n.node_id() != args.node_id && is_compactable(n.modes()))
-        .map(|n| n.node_id())
+        .map(|n| (n.node_id(), n.modes().clone()))
         .collect();
+    let targets = select_targets(&nodes, &args.node_id, args.compact_self);
 
-    if peers.is_empty() {
+    if targets.is_empty() {
         // Worth saying out loud: a compact-only node whose peers all serve queries has nothing it
         // may safely touch, and would otherwise look identical to one that is simply idle.
         // Warn rather than debug: a node started in `compact` mode with nothing to work on is
         // almost always a misconfiguration, and at default log levels a `debug!` here is
-        // indistinguishable from a healthy idle compactor.
+        // indistinguishable from a healthy idle compactor. A `--mode all` node always has at least
+        // itself, so this only fires for a genuine compact-only misconfiguration.
         warn!("no compactable peers; no registered peer ingests without also compacting");
         return;
     }
 
-    for peer in peers {
+    for target in targets {
         // Candidates come from whichever index the queries are served from, so the compactor can
         // never merge a file set the readers do not believe in.
-        for (db_id, table_id) in args.file_index.tables_for_node(&peer) {
-            let files = args.file_index.files_for_table(&peer, db_id, table_id);
+        for (db_id, table_id) in args.file_index.tables_for_node(&target) {
+            let files = args.file_index.files_for_table(&target, db_id, table_id);
             let groups = select_merges(db_id, table_id, &files, cold_before, &args.config);
 
             for group in groups {
-                match compact_group(args, &peer, &group).await {
+                match compact_group(args, &target, &group).await {
                     Ok(Some(outcome)) => {
                         info!(
-                            %peer,
+                            %target,
                             ?db_id,
                             ?table_id,
                             inputs = group.inputs.len(),
@@ -382,13 +431,13 @@ async fn compact_once(args: &CompactorArgs, deleter: &InputDeleter) {
                             output_rows = outcome.merged.row_count,
                             "compacted files"
                         );
-                        deleter.schedule(&peer, &group.inputs).await;
+                        deleter.schedule(&target, &group.inputs).await;
                     }
                     Ok(None) => {}
                     Err(error) => {
                         // One failed merge must not stall the others. The inputs are untouched, so
                         // the next pass simply retries them.
-                        warn!(%peer, ?db_id, ?table_id, %error, "compaction failed; inputs left in place");
+                        warn!(%target, ?db_id, ?table_id, %error, "compaction failed; inputs left in place");
                     }
                 }
             }
@@ -400,10 +449,14 @@ struct CompactionOutcome {
     merged: ParquetFile,
 }
 
-/// Merge one group, publish it, and tell the owner.
+/// Merge one group, publish it, and record it against the owner.
+///
+/// `target` is the prefix that owns the files — a peer, or this node itself for `--mode all`. The
+/// merge is written under `{target}/` either way; only the final recording step differs (RPC to a
+/// peer, in-process call for self).
 async fn compact_group(
     args: &CompactorArgs,
-    peer: &Arc<str>,
+    target: &Arc<str>,
     group: &MergeGroup,
 ) -> Result<Option<CompactionOutcome>, CompactorError> {
     let Some(db_schema) = args.catalog.db_schema_by_id(&group.db_id) else {
@@ -415,12 +468,12 @@ async fn compact_group(
         return Ok(None);
     };
 
-    // A Persister scoped to the peer's prefix. Paths it builds land under `{peer}/`, which is what
-    // makes the merged file and its snapshot show up as that peer's, exactly like the files being
-    // replaced.
-    let peer_persister = Persister::new(
+    // A Persister scoped to the target's prefix. Paths it builds land under `{target}/`, which is
+    // what makes the merged file and its snapshot show up as that node's, exactly like the files
+    // being replaced.
+    let target_persister = Persister::new(
         args.persister.object_store(),
-        Arc::clone(peer),
+        Arc::clone(target),
         Arc::clone(&args.time_provider),
         None,
     );
@@ -464,7 +517,7 @@ async fn compact_group(
     }
 
     let path = ParquetFilePath::new_with_chunk_ordinal(
-        peer,
+        target,
         group.db_id.get(),
         group.table_id.get(),
         group.chunk_time(),
@@ -482,7 +535,7 @@ async fn compact_group(
         ),
     );
 
-    let (size_bytes, _meta, _to_cache) = peer_persister
+    let (size_bytes, _meta, _to_cache) = target_persister
         .persist_parquet_file(path.clone(), batch_stream)
         .await
         .map_err(|e| CompactorError::Write(e.to_string()))?;
@@ -499,9 +552,30 @@ async fn compact_group(
         max_time: group.max_time(),
     };
 
-    // Only after the owner confirms does this count as done — its acknowledgement is what proves the
-    // replacement is durable, and therefore what makes deleting the inputs safe.
-    notify_owner(args, peer, group, &merged).await?;
+    // The merge only counts as done once the owner has recorded it — that is what proves the
+    // replacement is durable and makes deleting the inputs safe. For a peer that means an RPC; when
+    // the target is this node (`--mode all`), the same recording runs in-process against our own
+    // `PersistedFiles` and allocators — no RPC, no `conn_info` needed.
+    if target.as_ref() == args.node_id.as_ref() {
+        let notice = crate::rpc::notice::CompactionNotice::new(
+            target.to_string(),
+            group.db_id,
+            group.table_id,
+            &merged,
+            group.inputs.iter().map(|f| f.path.to_string()).collect(),
+        );
+        crate::rpc::server::apply_compaction_locally(
+            &args.inner,
+            &args.catalog,
+            &args.persister,
+            &args.node_id,
+            &notice,
+        )
+        .await
+        .map_err(|e| CompactorError::RecordLocal(e.to_string()))?;
+    } else {
+        notify_owner(args, target, group, &merged).await?;
+    }
 
     Ok(Some(CompactionOutcome { merged }))
 }

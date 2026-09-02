@@ -53,6 +53,136 @@ pub struct PeerChunkService {
     file_index: Option<Arc<crate::file_index::FileIndex>>,
 }
 
+/// Why [`apply_compaction_locally`] refused or failed to record a merge.
+///
+/// Kept separate from `tonic::Status` so the in-process caller (`--mode all` compacting its own
+/// files) does not depend on the gRPC layer. The RPC handler maps it back to a `Status`.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CompactionApplyError {
+    #[error("compaction notice names prefix {got:?}, but this node is {expected:?}")]
+    WrongNode { expected: String, got: String },
+
+    #[error("persisting compaction snapshot: {0}")]
+    Persist(String),
+}
+
+impl From<CompactionApplyError> for Status {
+    fn from(err: CompactionApplyError) -> Self {
+        match err {
+            CompactionApplyError::WrongNode { .. } => Status::invalid_argument(err.to_string()),
+            CompactionApplyError::Persist(_) => Status::internal(err.to_string()),
+        }
+    }
+}
+
+/// Record a compaction against `node_id`'s own Parquet: swap `PersistedFiles` in memory, then
+/// persist one `PersistedSnapshot` so the swap survives a restart and reaches the table index and
+/// every querier's `PeerFiles`.
+///
+/// This node — not whoever planned the merge — allocates every identifier. Both the snapshot
+/// sequence and the `ParquetFileId` come from per-node allocators, so allocating them here is what
+/// keeps the compaction inside the one namespace that may legitimately advance them. It is called
+/// two ways: from the RPC handler when a remote compactor merged this node's files, and directly
+/// by the in-process compactor of a `--mode all` node merging its own.
+///
+/// Returning `Ok` means the inputs are safe to delete after the grace period, so every failure
+/// below propagates rather than being swallowed. An idempotent redelivery (nothing changed) also
+/// returns `Ok`, without writing a second snapshot.
+pub(crate) async fn apply_compaction_locally(
+    write_buffer: &WriteBufferImpl,
+    catalog: &Catalog,
+    persister: &Persister,
+    node_id: &str,
+    notice: &CompactionNotice,
+) -> Result<(), CompactionApplyError> {
+    // A notice names the prefix it was written to. Acting on one that names someone else would let
+    // any peer able to reach this port drive files out of this node's index.
+    if notice.node_id.as_str() != node_id {
+        return Err(CompactionApplyError::WrongNode {
+            expected: node_id.to_string(),
+            got: notice.node_id.clone(),
+        });
+    }
+
+    let db_id = notice.db_id();
+    let table_id = notice.table_id();
+
+    // Mint from this node's allocator, then swap under one lock acquisition. `apply_compaction`
+    // adds before it removes, so the rows are advertised by one file or the other at every instant.
+    let merged = notice.merged_file(ParquetFileId::new());
+    let persisted_files = write_buffer.persisted_files();
+    let (added, removed_files) = persisted_files.apply_compaction(
+        db_id,
+        table_id,
+        std::slice::from_ref(&merged),
+        &notice.removed_paths,
+    );
+
+    // Nothing changed, so this is a redelivery — or a second compactor arriving late with a merge
+    // whose inputs are already gone. Either way the durable record exists, and writing another
+    // would burn a sequence number to say nothing.
+    if added == 0 && removed_files.is_empty() {
+        debug!(
+            %notice.merged_path,
+            "compaction notice already applied; no snapshot written"
+        );
+        return Ok(());
+    }
+
+    // Reserving is not the same as reading the last sequence and adding one: that reserves nothing,
+    // and the WAL flush path would hand the same number to a real snapshot whose unconditional PUT
+    // then overwrites whichever manifest lost the race.
+    let seq = write_buffer.wal().reserve_snapshot_sequence_number().await;
+    // A compaction persists no buffered rows — it only swaps already-persisted Parquet — so this
+    // snapshot must carry the WAL watermark a *real* snapshot last established, not the newest WAL
+    // file that exists. `last_wal_sequence_number()` is the latter: stamping it here makes the next
+    // restart treat every WAL file up to "now" as snapshotted and skip the un-persisted ones,
+    // silently dropping their writes.
+    let wal_seq = write_buffer.wal().last_persisted_wal_sequence_number().await;
+
+    let mut snapshot =
+        PersistedSnapshot::new(node_id.to_string(), seq, wal_seq, catalog.sequence_number());
+
+    // Set the aggregates by hand: `add_parquet_file` is private, and it also re-reads
+    // `ParquetFileId::next_id()`, which would be redundant here since the id is already minted.
+    snapshot.next_file_id = ParquetFileId::next_id();
+    snapshot.parquet_size_bytes = merged.size_bytes;
+    snapshot.row_count = merged.row_count;
+    snapshot.min_time = merged.min_time;
+    snapshot.max_time = merged.max_time;
+
+    let mut added_tables = DatabaseTables::default();
+    added_tables.tables.insert(table_id, vec![merged.clone()]);
+    snapshot.databases.insert(db_id, added_tables);
+
+    // These carry this node's own ids, which matters because the two downstream consumers match
+    // differently: the table index prunes by `ParquetFileId`, while `PeerFiles` removes by path.
+    let removed_count = removed_files.len();
+    if removed_count > 0 {
+        let mut removed_tables = DatabaseTables::default();
+        removed_tables.tables.insert(table_id, removed_files);
+        snapshot.removed_files.insert(db_id, removed_tables);
+    }
+
+    persister
+        .persist_snapshot(&PersistedSnapshotVersion::V1(snapshot))
+        .await
+        .map_err(|e| {
+            // The in-memory swap already happened. Report the failure so the compactor does not
+            // delete the inputs; this node recovers its old view on restart.
+            CompactionApplyError::Persist(e.to_string())
+        })?;
+
+    info!(
+        sequence = seq.as_u64(),
+        added,
+        removed = removed_count,
+        merged_path = %notice.merged_path,
+        "recorded compaction"
+    );
+    Ok(())
+}
+
 impl PeerChunkService {
     pub fn new(
         write_buffer: Arc<WriteBufferImpl>,
@@ -96,111 +226,19 @@ impl PeerChunkService {
 
     /// Record a compaction a compactor performed on this node's Parquet.
     ///
-    /// This node — not the compactor — allocates every identifier involved. Both the snapshot
-    /// sequence and the `ParquetFileId` come from per-node allocators, so allocating them here is
-    /// what keeps the compaction inside the one namespace that may legitimately advance them.
-    ///
-    /// Two effects, in this order:
-    ///
-    /// 1. **In memory.** `PersistedFiles` is swapped immediately. Nothing else refreshes it from
-    ///    object store while the process runs, so without this the node would go on naming inputs
-    ///    that are about to be deleted.
-    /// 2. **Durably.** One `PersistedSnapshot` records the swap, which is what makes it survive a
-    ///    restart and what carries it to the table index and to every querier's `PeerFiles`.
-    ///
-    /// Returning `Ok` tells the compactor the inputs are safe to delete after its grace period, so
-    /// every failure below must propagate rather than be swallowed.
+    /// Thin wrapper over [`apply_compaction_locally`], which holds the actual logic so a `--mode all`
+    /// node can call it in-process without going through gRPC. Returning `Ok` tells the compactor
+    /// the inputs are safe to delete after its grace period.
     async fn apply_compaction_notice(&self, notice: &CompactionNotice) -> Result<(), Status> {
-        // A notice names the prefix it was written to. Acting on one that names someone else would
-        // let any peer able to reach this port drive files out of this node's index.
-        if notice.node_id.as_str() != &*self.node_id {
-            return Err(Status::invalid_argument(format!(
-                "compaction notice names prefix {:?}, but this node is {:?}",
-                notice.node_id, self.node_id
-            )));
-        }
-
-        let db_id = notice.db_id();
-        let table_id = notice.table_id();
-
-        // Mint from this node's allocator, then swap under one lock acquisition. `apply_compaction`
-        // adds before it removes, so the rows are advertised by one file or the other at every
-        // instant.
-        let merged = notice.merged_file(ParquetFileId::new());
-        let persisted_files = self.write_buffer.persisted_files();
-        let (added, removed_files) = persisted_files.apply_compaction(
-            db_id,
-            table_id,
-            std::slice::from_ref(&merged),
-            &notice.removed_paths,
-        );
-
-        // Nothing changed, so this is a redelivery — or a second compactor arriving late with a
-        // merge whose inputs are already gone. Either way the durable record exists, and writing
-        // another would burn a sequence number to say nothing.
-        if added == 0 && removed_files.is_empty() {
-            debug!(
-                %notice.merged_path,
-                "compaction notice already applied; no snapshot written"
-            );
-            return Ok(());
-        }
-
-        // Reserving is not the same as reading the last sequence and adding one: that reserves
-        // nothing, and the WAL flush path would hand the same number to a real snapshot whose
-        // unconditional PUT then overwrites whichever manifest lost the race.
-        let seq = self
-            .write_buffer
-            .wal()
-            .reserve_snapshot_sequence_number()
-            .await;
-        let wal_seq = self.write_buffer.wal().last_wal_sequence_number().await;
-
-        let mut snapshot = PersistedSnapshot::new(
-            self.node_id.to_string(),
-            seq,
-            wal_seq,
-            self.catalog.sequence_number(),
-        );
-
-        // Set the aggregates by hand: `add_parquet_file` is private, and it also re-reads
-        // `ParquetFileId::next_id()`, which would be redundant here since the id is already minted.
-        snapshot.next_file_id = ParquetFileId::next_id();
-        snapshot.parquet_size_bytes = merged.size_bytes;
-        snapshot.row_count = merged.row_count;
-        snapshot.min_time = merged.min_time;
-        snapshot.max_time = merged.max_time;
-
-        let mut added_tables = DatabaseTables::default();
-        added_tables.tables.insert(table_id, vec![merged.clone()]);
-        snapshot.databases.insert(db_id, added_tables);
-
-        // These carry this node's own ids, which matters because the two downstream consumers match
-        // differently: the table index prunes by `ParquetFileId`, while `PeerFiles` removes by path.
-        let removed_count = removed_files.len();
-        if removed_count > 0 {
-            let mut removed_tables = DatabaseTables::default();
-            removed_tables.tables.insert(table_id, removed_files);
-            snapshot.removed_files.insert(db_id, removed_tables);
-        }
-
-        self.persister
-            .persist_snapshot(&PersistedSnapshotVersion::V1(snapshot))
-            .await
-            .map_err(|e| {
-                // The in-memory swap already happened. Report the failure so the compactor does not
-                // delete the inputs; this node recovers its old view on restart.
-                Status::internal(format!("persisting compaction snapshot: {e}"))
-            })?;
-
-        info!(
-            sequence = seq.as_u64(),
-            added,
-            removed = removed_count,
-            merged_path = %notice.merged_path,
-            "recorded compaction"
-        );
-        Ok(())
+        apply_compaction_locally(
+            &self.write_buffer,
+            &self.catalog,
+            &self.persister,
+            &self.node_id,
+            notice,
+        )
+        .await
+        .map_err(Status::from)
     }
 
     /// Counter of served requests, for tests and metrics.

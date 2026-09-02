@@ -653,6 +653,14 @@ impl Wal for WalObjectStore {
             .last_wal_sequence_number()
     }
 
+    async fn last_persisted_wal_sequence_number(&self) -> WalFileSequenceNumber {
+        // Tracked by the remover: seeded at construction from the persisted-snapshot watermark and
+        // advanced only by `remove_snapshot_wal_files` after a real snapshot lands its Parquet.
+        // Never ahead of what is in object store; a lagging value only makes replay re-buffer a few
+        // already-persisted files, which the next snapshot cleans up.
+        self.wal_remover.last_snapshotted().unwrap_or_default()
+    }
+
     async fn last_snapshot_sequence_number(&self) -> SnapshotSequenceNumber {
         self.flush_buffer
             .lock()
@@ -998,6 +1006,12 @@ impl WalFileRemover {
         let mut inner = self.inner.lock();
         inner.update_last_wal_num(last_wal);
         inner.get_current_state()
+    }
+
+    /// The last WAL sequence number a completed snapshot has persisted. `None` before the first
+    /// snapshot on a node that started with no persisted snapshots.
+    fn last_snapshotted(&self) -> Option<WalFileSequenceNumber> {
+        self.inner.lock().last_snapshotted_wal_sequence_number
     }
 }
 

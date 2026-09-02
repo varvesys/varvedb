@@ -157,6 +157,50 @@ fn ingesting_peers_are_compactable_whether_or_not_they_serve_queries() {
 }
 
 #[test]
+fn select_targets_covers_peers_and_never_self_unless_asked() {
+    let nodes: Vec<(Arc<str>, Vec<NodeMode>)> = vec![
+        ("self01".into(), vec![NodeMode::All]),
+        ("ing02".into(), vec![NodeMode::Ingest]),
+        ("iq03".into(), vec![NodeMode::Ingest, NodeMode::Query]),
+        ("qry04".into(), vec![NodeMode::Query]),
+        ("cmp05".into(), vec![NodeMode::Compact]),
+    ];
+    let me: Arc<str> = "self01".into();
+
+    // compact_self = false: peers only, self excluded even though another node lists it.
+    let without_self = select_targets(&nodes, &me, false);
+    assert_eq!(
+        without_self.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        vec!["ing02", "iq03"],
+        "only ingesting non-compactors, and never self"
+    );
+
+    // compact_self = true: same peers, then self appended last.
+    let with_self = select_targets(&nodes, &me, true);
+    assert_eq!(
+        with_self.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        vec!["ing02", "iq03", "self01"],
+    );
+}
+
+#[test]
+fn select_targets_adds_self_even_before_its_registration_lands() {
+    // A lone `--mode all` node whose own `register_node` has not yet been observed still compacts
+    // its own prefix.
+    let me: Arc<str> = "solo".into();
+    assert_eq!(
+        select_targets(&[], &me, true)
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        vec!["solo"],
+    );
+    // ...and a compact-only node in the same situation gets nothing, which is what triggers the
+    // "no compactable peers" warning.
+    assert!(select_targets(&[], &me, false).is_empty());
+}
+
+#[test]
 fn output_path_discriminator_is_out_of_gen1_reach() {
     // gen1 uses chunk_ordinal only as a count of Arrow-varchar splits, so it stays small. Setting
     // the high bit puts compaction output where a gen1 file cannot collide with it.
