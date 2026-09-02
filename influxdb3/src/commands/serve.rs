@@ -957,6 +957,7 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
         "server starting",
     );
     debug!(%build_malloc_conf, "build configuration");
+    enable_jemalloc_background_thread();
 
     // check if any env vars that are deprecated is still being passed around and warn
     warn_use_of_deprecated_env_vars(DEPRECATED_ENV_VARS);
@@ -1031,7 +1032,11 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
     ));
 
     // setup cached object store:
-    let (object_store, parquet_cache) = if !config.disable_file_cache {
+    //
+    // Only a node that serves queries populates or reads this cache; on an ingest-only, compact-only
+    // or process-only node it is dead weight (a 20%-of-RAM allocation plus a prune loop that never
+    // has anything to prune), so skip building it there.
+    let (object_store, parquet_cache) = if !config.disable_file_cache && cluster.queries() {
         info!("initialising parquet cache");
         let (object_store, parquet_cache) = create_cached_obj_store_and_oracle(
             object_store,
@@ -1062,6 +1067,22 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
         "Creating shared query executor"
     );
 
+    // Size the shared executor's memory pool to the node's role. A query (or `all`) node keeps the
+    // full `--exec-mem-pool-size` (20% of RAM by default). A compact-only node still runs merges on
+    // this executor, so it keeps a real budget — capped at ~2 GiB so one runaway merge spills or
+    // errors instead of ballooning RSS. An ingest-only node barely touches this executor at all.
+    // A process node keeps the full pool: plugins can run SQL through it.
+    let exec_mem_pool_size = if cluster.queries() || cluster.processes() {
+        config.exec_mem_pool_size.as_num_bytes()
+    } else if cluster.compacts() {
+        std::cmp::min(
+            config.exec_mem_pool_size.as_num_bytes(),
+            2 * 1024 * 1024 * 1024,
+        )
+    } else {
+        256 * 1024 * 1024
+    };
+
     let exec = Arc::new(Executor::new_with_config_and_executor(
         ExecutorConfig {
             target_query_partitions: tokio_datafusion_config.num_threads.unwrap(),
@@ -1070,7 +1091,7 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
                 .map(|store| (store.id(), Arc::clone(store.object_store())))
                 .collect(),
             metric_registry: Arc::clone(&metrics),
-            mem_pool_size: config.exec_mem_pool_size.as_num_bytes(),
+            mem_pool_size: exec_mem_pool_size,
             // TODO: need to make these configurable?
             per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
             heap_memory_limit: None,
@@ -1914,6 +1935,26 @@ pub fn build_malloc_conf() -> String {
         .unwrap()
         .to_string()
 }
+
+/// Turn on jemalloc's background thread so freed pages are decayed and returned to the OS on a
+/// timer rather than only when the owning arena is next allocated into.
+///
+/// Without it a process that allocates in bursts and is otherwise idle — a compaction node between
+/// passes is the case that surfaced this — holds every spike's pages as RSS indefinitely. Enabled
+/// at runtime rather than via the baked `malloc_conf` because `background_thread:true` in the conf
+/// string is rejected on platforms where jemalloc builds without background-thread support (macOS),
+/// which would poison the whole conf. `write` here simply returns an error on those platforms; log
+/// it and move on.
+#[cfg(all(feature = "jemalloc_replacing_malloc", not(target_env = "msvc")))]
+fn enable_jemalloc_background_thread() {
+    match tikv_jemalloc_ctl::background_thread::write(true) {
+        Ok(()) => debug!("jemalloc background_thread enabled"),
+        Err(e) => debug!(%e, "jemalloc background_thread not enabled (unsupported on this platform?)"),
+    }
+}
+
+#[cfg(any(not(feature = "jemalloc_replacing_malloc"), target_env = "msvc"))]
+fn enable_jemalloc_background_thread() {}
 
 pub fn setup_metric_registry() -> Arc<metric::Registry> {
     let registry = Arc::new(metric::Registry::default());

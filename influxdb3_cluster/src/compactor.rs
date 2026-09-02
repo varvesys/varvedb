@@ -508,13 +508,12 @@ async fn compact_group(
 
     let ctx = args.executor.new_context();
     let physical_plan = ctx.create_physical_plan(&logical_plan).await?;
-    let batches = ctx.collect(physical_plan).await?;
-    let row_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-
-    if row_count == 0 {
-        warn!(?group.db_id, ?group.table_id, "merge produced no rows; leaving inputs in place");
-        return Ok(None);
-    }
+    // Stream the merged output straight into the Parquet writer rather than `ctx.collect()`ing the
+    // whole thing into a `Vec<RecordBatch>` first: a merge can decompress to several times its
+    // target size in Arrow, and holding all of it resident every pass is what drives a compaction
+    // node's RSS up. `execute_stream` is exactly what `collect()` uses internally — it coalesces
+    // partitions — so output rows and order are unchanged.
+    let batch_stream = ctx.execute_stream(physical_plan).await?;
 
     let path = ParquetFilePath::new_with_chunk_ordinal(
         target,
@@ -527,18 +526,20 @@ async fn compact_group(
         output_path_discriminator(group),
     );
 
-    let stream = futures::stream::iter(batches.into_iter().map(Ok));
-    let batch_stream = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            table_def.schema.as_arrow(),
-            stream,
-        ),
-    );
-
-    let (size_bytes, _meta, _to_cache) = target_persister
+    let (size_bytes, meta, _to_cache) = match target_persister
         .persist_parquet_file(path.clone(), batch_stream)
         .await
-        .map_err(|e| CompactorError::Write(e.to_string()))?;
+    {
+        Ok(written) => written,
+        // The merge planned rows but produced none (e.g. every input row was a delete tombstone).
+        // Nothing was written; leave the inputs in place for the next pass.
+        Err(influxdb3_write::persister::PersisterError::NoRows) => {
+            warn!(?group.db_id, ?group.table_id, "merge produced no rows; leaving inputs in place");
+            return Ok(None);
+        }
+        Err(e) => return Err(CompactorError::Write(e.to_string())),
+    };
+    let row_count = meta.file_metadata().num_rows() as u64;
 
     // Id `0` is a placeholder: the owner assigns the real one from its own allocator when it records
     // the merge. It is never written anywhere in this form.
