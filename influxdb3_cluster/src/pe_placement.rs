@@ -148,19 +148,25 @@ impl ClusterPlacement {
 mod tests {
     use super::*;
     use hashbrown::HashMap;
-    use influxdb3_catalog::catalog::{ErrorBehavior, TriggerSettings};
+    use influxdb3_catalog::catalog::{
+        CatalogArgs, CatalogLimits, ErrorBehavior, NodeMode, TriggerSettings,
+    };
     use influxdb3_id::TriggerId;
+    use influxdb3_process::ProcessUuidWrapper;
+    use iox_time::{MockProvider, Time, TimeProvider};
+    use object_store::memory::InMemory;
 
-    fn trigger(args: &[(&str, &str)]) -> TriggerDefinition {
+    fn trigger_with(
+        spec: TriggerSpecificationDefinition,
+        args: &[(&str, &str)],
+    ) -> TriggerDefinition {
         TriggerDefinition {
             trigger_id: TriggerId::new(0),
             trigger_name: "t".into(),
             plugin_filename: "p.py".into(),
             database_name: "db".into(),
             node_spec: NodeSpec::All,
-            trigger: TriggerSpecificationDefinition::Schedule {
-                schedule: "* * * * * *".into(),
-            },
+            trigger: spec,
             trigger_settings: TriggerSettings {
                 run_async: false,
                 error_behavior: ErrorBehavior::Log,
@@ -176,6 +182,140 @@ mod tests {
             },
             disabled: false,
         }
+    }
+
+    /// A schedule trigger (fires on every processing-engine node it is placed on).
+    fn trigger(args: &[(&str, &str)]) -> TriggerDefinition {
+        trigger_with(
+            TriggerSpecificationDefinition::Schedule {
+                schedule: "* * * * * *".into(),
+            },
+            args,
+        )
+    }
+
+    /// A WAL trigger (only sees the writes of the ingester it runs on).
+    fn wal_trigger(args: &[(&str, &str)]) -> TriggerDefinition {
+        trigger_with(TriggerSpecificationDefinition::AllTablesWalWrite, args)
+    }
+
+    /// Build an in-memory cluster catalog whose current node is `current`, with every
+    /// `(name, modes)` in `nodes` registered. `current` must appear in `nodes`.
+    async fn cluster_catalog(current: &str, nodes: &[(&str, &[NodeMode])]) -> Arc<Catalog> {
+        let store = Arc::new(InMemory::new());
+        let time: Arc<dyn TimeProvider> =
+            Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+        let catalog = Catalog::new_enterprise(
+            current,
+            "test-cluster",
+            store,
+            time,
+            Default::default(),
+            Arc::new(CatalogLimits::none()),
+            CatalogArgs::default(),
+        )
+        .await
+        .expect("build enterprise catalog");
+
+        for (name, modes) in nodes {
+            catalog
+                .register_node(
+                    name,
+                    4,
+                    modes.to_vec(),
+                    Arc::new(ProcessUuidWrapper::new()),
+                    Arc::from(format!("inst-{name}")),
+                    None,
+                    None,
+                    0,
+                )
+                .await
+                .expect("register node");
+        }
+        catalog
+    }
+
+    /// `true` if the current node (per `catalog`) would run `trig`.
+    fn allows(catalog: &Arc<Catalog>, trig: &TriggerDefinition) -> bool {
+        trigger_placement(Arc::clone(catalog)).allows(trig)
+    }
+
+    #[tokio::test]
+    async fn unpinned_trigger_runs_on_every_node() {
+        let catalog = cluster_catalog(
+            "q1",
+            &[("q1", &[NodeMode::Query]), ("i1", &[NodeMode::Ingest])],
+        )
+        .await;
+        assert!(allows(&catalog, &trigger(&[])));
+        assert!(allows(&catalog, &trigger(&[("node_spec", "all")])));
+    }
+
+    #[tokio::test]
+    async fn trigger_pinned_to_this_node_runs() {
+        let catalog = cluster_catalog(
+            "i1",
+            &[("i1", &[NodeMode::Ingest]), ("i2", &[NodeMode::Ingest])],
+        )
+        .await;
+        assert!(allows(&catalog, &trigger(&[("node_spec", "nodes:i1")])));
+        assert!(allows(&catalog, &trigger(&[("node_spec", "nodes:i1,i2")])));
+    }
+
+    #[tokio::test]
+    async fn trigger_pinned_elsewhere_does_not_run() {
+        let catalog = cluster_catalog(
+            "i1",
+            &[("i1", &[NodeMode::Ingest]), ("i2", &[NodeMode::Ingest])],
+        )
+        .await;
+        assert!(!allows(&catalog, &trigger(&[("node_spec", "nodes:i2")])));
+    }
+
+    #[tokio::test]
+    async fn node_spec_naming_an_unknown_node_does_not_run() {
+        let catalog = cluster_catalog("i1", &[("i1", &[NodeMode::Ingest])]).await;
+        // `ghost` is not registered -> name resolution fails -> refuse (with a warn).
+        assert!(!allows(&catalog, &trigger(&[("node_spec", "nodes:ghost")])));
+        // A real node alongside an unknown one still fails as a whole.
+        assert!(!allows(
+            &catalog,
+            &trigger(&[("node_spec", "nodes:i1,ghost")])
+        ));
+    }
+
+    #[tokio::test]
+    async fn wal_trigger_refused_on_a_non_ingest_node() {
+        let catalog = cluster_catalog(
+            "q1",
+            &[("q1", &[NodeMode::Query]), ("i1", &[NodeMode::Ingest])],
+        )
+        .await;
+        // Unpinned: placement lands it here (a query node), where it could never fire.
+        assert!(!allows(&catalog, &wal_trigger(&[])));
+    }
+
+    #[tokio::test]
+    async fn wal_trigger_runs_on_an_ingest_node() {
+        let catalog = cluster_catalog(
+            "i1",
+            &[("i1", &[NodeMode::Ingest]), ("q1", &[NodeMode::Query])],
+        )
+        .await;
+        assert!(allows(&catalog, &wal_trigger(&[])));
+        assert!(allows(&catalog, &wal_trigger(&[("node_spec", "nodes:i1")])));
+    }
+
+    #[tokio::test]
+    async fn wal_trigger_pinned_elsewhere_is_skipped_before_the_type_check() {
+        // Current node is a query node; the WAL trigger is pinned to the ingester. The pin
+        // check comes first, so this node just declines quietly rather than warning.
+        let catalog = cluster_catalog(
+            "q1",
+            &[("q1", &[NodeMode::Query]), ("i1", &[NodeMode::Ingest])],
+        )
+        .await;
+        assert!(!allows(&catalog, &wal_trigger(&[("node_spec", "nodes:i1")])));
     }
 
     #[test]
