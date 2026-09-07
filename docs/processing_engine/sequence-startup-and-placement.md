@@ -80,3 +80,7 @@ flowchart TD
 - `run_trigger` is the **only** per-node "should I run this trigger" decision point; it is
   reached from `start_triggers()` (boot) and from `background_catalog_update`'s
   `TriggerCreated` / `TriggerEnabled` handling.
+- Placement is **not** re-evaluated on `NodeRegistered` / `NodeUnregistered` — this is a
+  deliberate choice, not a gap. To move a running trigger onto a newly-added node, edit the
+  trigger (disable + enable re-runs placement everywhere) or restart that node. Rationale is
+  in the `influxdb3_cluster::pe_placement` module docs and `README_processing_engine.md`.

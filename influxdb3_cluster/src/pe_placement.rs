@@ -16,6 +16,26 @@
 //!
 //! The dedicated `TriggerDefinition.node_spec` field is left `All` by the core create path, so
 //! this side-channel is used instead — it needs no change to the CLI / wire / catalog code.
+//!
+//! ## When placement is (re-)evaluated
+//!
+//! [`allows`](TriggerPlacement::allows) is called from `run_trigger`, which the processing
+//! engine invokes at startup (`start_triggers`) and on the `TriggerCreated` / `TriggerEnabled`
+//! catalog events. It is **not** re-run on `NodeRegistered` / `NodeUnregistered`. This is
+//! deliberate:
+//!
+//! * a membership change would make every node re-evaluate every trigger, and a rolling
+//!   restart churns membership on every node;
+//! * a node that a `node_spec` newly points at needs its plugin files placed there by an
+//!   operator anyway, so picking the trigger up is already a deliberate, staged action;
+//! * reacting to node lifecycle here would widen this crate's coupling to the catalog's node
+//!   events and the processing engine's event loop, which the [`TriggerPlacement`] seam exists
+//!   to keep narrow.
+//!
+//! To move a running trigger onto a newly-added node: edit the trigger (a disable + enable, or
+//! any update, re-runs placement cluster-wide), or restart that node. A node dropped from a
+//! `node_spec` keeps running the trigger until the same nudge — harmless, since the trigger is
+//! still a legitimate placement target until then.
 
 use std::str::FromStr;
 use std::sync::Arc;

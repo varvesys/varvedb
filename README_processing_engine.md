@@ -343,8 +343,14 @@ is `node_spec` reaches the plugin with `args=None`, exactly as if none were set.
 * **Write-back is local.** `influxdb3_local.write()` targets the node the plugin runs on.
   Pin schedule/request triggers to an ingest-capable node (`--mode ingest,query` or `all`
   plus `--plugin-dir`), or have the plugin POST line protocol to an ingester itself.
-* **Placement is evaluated at startup and on trigger create/enable/disable.** A node added
-  to an existing trigger's `node_spec` picks the trigger up only after it restarts.
+* **Placement is not re-evaluated on node join/leave (by design).** It runs at node startup
+  and on trigger create / enable / disable — not on a node registering or unregistering.
+  Re-evaluating on membership changes would have every node reconsider every trigger on each
+  change (a rolling restart alone churns membership repeatedly), and a node a `node_spec`
+  newly points at needs its plugin files staged there by an operator regardless. To move a
+  running trigger onto a freshly-added node, edit the trigger (a disable + enable re-runs
+  placement cluster-wide) or restart that node; a node dropped from a `node_spec` keeps
+  running the trigger until the same nudge.
 * **No create-time validation.** A bad `node_spec` (unknown node id, or a WAL trigger on a
   non-ingest node) is a warning + no-run at trigger start, not a `create trigger` error. The
   warning names the specific unresolved entries (`unknown_nodes=…`); note that a node that
