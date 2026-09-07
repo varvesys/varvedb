@@ -44,6 +44,9 @@ tokio.workspace = true
 [dev-dependencies]
 influxdb3_test_helpers = { path = "../influxdb3_test_helpers" }
 hashbrown.workspace = true
+# downsampler_e2e integration test (ignored by default); serde_json is already a dep
+reqwest = { workspace = true, features = ["blocking"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true
