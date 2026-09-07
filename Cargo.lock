@@ -4048,7 +4048,7 @@ dependencies = [
 
 [[package]]
 name = "influxdb3_cluster"
-version = "3.11.2"
+version = "3.11.4"
 dependencies = [
  "arrow",
  "arrow-flight",
