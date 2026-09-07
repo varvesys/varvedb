@@ -6,6 +6,10 @@ https://docs.influxdata.com/influxdb3/core/
 See the 'Discussion' section for more information on why the processing engine
 is implemented the way it is.
 
+For a component diagram and per-flow sequence diagrams (startup/placement, WAL-flush,
+scheduled, and HTTP request triggers), see
+[docs/processing_engine/architecture.md](docs/processing_engine/architecture.md).
+
 
 ## Implementation
 
@@ -287,6 +291,67 @@ Local development with python-build-standalone currently consists of:
     $ \path\to\python-standalone\python\influxdb3.exe ... --plugin-dir \path\to\plugin\dir
     ```
 
+
+## Running in a cluster
+
+In a multi-node cluster (`--cluster-id` set) the Processing Engine is per-node and trigger
+placement is explicit.
+
+### Activation
+
+Setting `--plugin-dir` (or `INFLUXDB3_PLUGIN_DIR`) activates the engine on a node and adds
+`process` to that node's registered modes — `process` is a consequence of the flag, not a
+`--mode` you select, and it coexists with any other mode (`--mode compact --plugin-dir …`
+is a legitimate `[compact, process]` node). Setting `INFLUXDB3_PLUGIN_DIR=""` does **not**
+disable the engine; unset the variable.
+
+`--plugin-dir` must be configured, with the referenced plugin files present, on **every
+node a trigger is pinned to**. A trigger whose plugin file is missing on the node that runs
+it fails per invocation (following `--error-behavior`) — it does not stop the node from
+booting.
+
+### Pinning triggers — `node_spec` trigger argument
+
+Pin a trigger to specific nodes with a `node_spec` **trigger argument**:
+
+```
+influxdb3 create trigger \
+  --trigger-spec "every:5m" \
+  --trigger-arguments node_spec=nodes:host01,host02 \
+  …
+```
+
+* absent / `node_spec=all` (default) — every processing-engine node runs the trigger.
+* `node_spec=nodes:<node-id>[,<node-id>]` — only the listed nodes.
+
+The value also appears in the plugin's `args` dict; plugins that ignore unknown keys are
+unaffected.
+
+### Footguns
+
+* **No pin duplicates execution.** An `every:`/`cron:` trigger with no `node_spec` fires
+  once **per** processing-engine node, and a `request:` route then exists on each of them.
+  Add `--trigger-arguments node_spec=nodes:<id>`.
+* **WAL triggers are per-ingester.** Each ingester owns its own WAL, so a WAL trigger sees
+  only the writes of the node it runs on. Pin it to one ingester, or expect it to run on
+  each ingester over that ingester's writes. A WAL trigger pinned to a node that does not
+  ingest logs a warning at startup and does not run there.
+* **Request triggers have no cross-node routing.** `POST /api/v3/engine/<path>` returns 200
+  only on a node the trigger is pinned to and 404 everywhere else. Point a load balancer at
+  the pinned node(s) specifically.
+* **Write-back is local.** `influxdb3_local.write()` targets the node the plugin runs on.
+  Pin schedule/request triggers to an ingest-capable node (`--mode ingest,query` or `all`
+  plus `--plugin-dir`), or have the plugin POST line protocol to an ingester itself.
+* **Placement is evaluated at startup and on trigger create/enable/disable.** A node added
+  to an existing trigger's `node_spec` picks the trigger up only after it restarts.
+* **No create-time validation.** A bad `node_spec` (unknown node id, or a WAL trigger on a
+  non-ingest node) is a warning + no-run at trigger start, not a `create trigger` error.
+
+### Recommended pattern
+
+Many clusters avoid WAL triggers and use **schedule + request**: one ingest-capable
+processing node pulls aggregated state on a schedule and writes the rollup back locally; a
+`request:` trigger on a query node serves point queries from that rolled-up data.
 
 ## Discussion
 
