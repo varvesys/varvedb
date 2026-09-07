@@ -2,7 +2,7 @@
 //!
 //! # Why this replaces per-peer polling
 //!
-//! [`PeerFiles`](crate::peer_files::PeerFiles) is built by polling each peer's own
+//! `PeerFiles` — the mechanism this index replaced — was built by polling each peer's own
 //! `snapshots/` prefix, which gives every node a *separate* view assembled from *per-node*
 //! sequence numbers. Three problems follow from that, and all three are structural:
 //!
