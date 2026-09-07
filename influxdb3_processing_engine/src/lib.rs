@@ -120,6 +120,7 @@ pub struct ProcessingEngineManagerImpl {
     time_provider: Arc<dyn TimeProvider>,
     cache: Arc<Mutex<CacheStore>>,
     scheduler: scheduler::Scheduler,
+    worker: Arc<worker::local::PythonTriggerWorker>,
     /// Maximum concurrent invocations per `run_async` trigger; `NonZeroUsize::MAX`
     /// means unlimited.
     async_trigger_concurrency_limit: NonZeroUsize,
@@ -419,9 +420,12 @@ impl ProcessingEngineManagerImpl {
             plugin_shutdown: plugin_shutdown.clone(),
             plugin_trigger_invocation_registry: plugin_trigger_invocation_registry.clone(),
         });
-        let scheduler = scheduler::Scheduler::new(Arc::clone(&node_id), |scheduler| {
-            worker.register_scheduler(scheduler);
-            vec![worker]
+        let scheduler = scheduler::Scheduler::new(Arc::clone(&node_id), {
+            let worker = Arc::clone(&worker);
+            |scheduler| {
+                worker.register_scheduler(scheduler);
+                vec![worker as _]
+            }
         });
         let pem = Arc::new(Self {
             environment_manager: environment,
@@ -430,6 +434,7 @@ impl ProcessingEngineManagerImpl {
             query_endpoint,
             time_provider,
             scheduler,
+            worker,
             async_trigger_concurrency_limit,
             trigger_registry: Default::default(),
             placement,
@@ -856,6 +861,7 @@ impl ProcessingEngineManagerImpl {
         self.scheduler.shutdown_trigger(key).await;
         self.trigger_registry.write().await.remove_trigger(key);
         self.cache.lock().drop_trigger_cache(db_id, trigger_id);
+        self.worker.forget_trigger(key);
 
         Ok(())
     }
@@ -1356,6 +1362,8 @@ fn background_catalog_update(
                             .scheduler
                             .shutdown_triggers_for_db(*db_id)
                             .await;
+                        // must run after scheduler shutdown
+                        processing_engine_manager.worker.forget_all_for_db(*db_id);
                         if !hard_delete_pending {
                             processing_engine_manager
                                 .trigger_registry
@@ -1374,6 +1382,8 @@ fn background_catalog_update(
                             .scheduler
                             .shutdown_triggers_for_db(*db_id)
                             .await;
+                        // must run after scheduler shutdown
+                        processing_engine_manager.worker.forget_all_for_db(*db_id);
                         processing_engine_manager
                             .trigger_registry
                             .write()
