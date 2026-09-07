@@ -10,6 +10,11 @@ back, see the companion sequence diagrams:
 - [Scheduled trigger (`every:` / `cron:`)](sequence-schedule-trigger.md)
 - [HTTP request trigger (`request:<path>`)](sequence-request-trigger.md)
 
+Design notes for not-yet-built work:
+
+- [Cross-node write-back from a plugin](design-cross-node-writeback.md) (a `WriteEndpoint`
+  seam mirroring `TriggerPlacement`; Flight `do_put` over a peer's `conn_info`)
+
 ## Component diagram
 
 ```mermaid
