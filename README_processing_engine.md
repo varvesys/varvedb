@@ -324,8 +324,9 @@ influxdb3 create trigger \
 * absent / `node_spec=all` (default) — every processing-engine node runs the trigger.
 * `node_spec=nodes:<node-id>[,<node-id>]` — only the listed nodes.
 
-The value also appears in the plugin's `args` dict; plugins that ignore unknown keys are
-unaffected.
+`node_spec` is a control-plane key: it is stripped from the argument map before the plugin
+runs, so it never appears in the plugin's `args` dict. A trigger whose only trigger-argument
+is `node_spec` reaches the plugin with `args=None`, exactly as if none were set.
 
 ### Footguns
 

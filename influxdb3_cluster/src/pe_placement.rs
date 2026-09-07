@@ -23,11 +23,10 @@ use std::sync::Arc;
 use influxdb3_catalog::catalog::{
     ApiNodeSpec, Catalog, NodeSpec, TriggerDefinition, TriggerSpecificationDefinition,
 };
-use influxdb3_catalog::enterprise::trigger_placement::TriggerPlacement;
+use influxdb3_catalog::enterprise::trigger_placement::{
+    NODE_SPEC_TRIGGER_ARGUMENT as NODE_SPEC_ARG, TriggerPlacement,
+};
 use observability_deps::tracing::warn;
-
-/// The `trigger_arguments` key that carries a node placement for a cluster.
-const NODE_SPEC_ARG: &str = "node_spec";
 
 /// The placement a trigger's `node_spec` argument asks for, before catalog resolution.
 #[derive(Debug, PartialEq, Eq)]

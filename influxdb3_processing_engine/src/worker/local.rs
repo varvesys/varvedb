@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use hashbrown::HashMap;
 use humantime::format_duration;
 use influxdb3_catalog::catalog::{Catalog, TriggerDefinition, TriggerSpecificationDefinition};
+use influxdb3_catalog::enterprise::trigger_placement::plugin_visible_trigger_arguments;
 use influxdb3_id::DbId;
 use influxdb3_processing_engine_telemetry::{
     PluginTriggerEntrypoint, PluginTriggerInvocationKey, PluginTriggerInvocationRegistry,
@@ -303,6 +304,12 @@ impl TriggerPlugin {
         )
     }
 
+    /// `trigger_arguments` as the plugin should see them — placement / control-plane keys
+    /// (`node_spec`, …) removed. See [`plugin_visible_trigger_arguments`].
+    fn plugin_trigger_arguments(&self) -> Option<HashMap<String, String>> {
+        plugin_visible_trigger_arguments(&self.trigger_definition.trigger_arguments)
+    }
+
     async fn handle_successful_run(
         &self,
         plugin_return_state: PluginReturnState,
@@ -359,7 +366,7 @@ impl TriggerPlugin {
 
         let plugin_code = self.plugin_code.code();
         let plugin_root = self.plugin_code.plugin_root().cloned();
-        let trigger_arguments = self.trigger_definition.trigger_arguments.clone();
+        let trigger_arguments = self.plugin_trigger_arguments();
         let run_logger = self.logger.for_run();
         let logger = PluginLogger::production(run_logger.clone());
         let query_endpoint = Arc::clone(&self.query_endpoint);
@@ -399,7 +406,7 @@ impl TriggerPlugin {
         let query_endpoint = Arc::clone(&self.query_endpoint);
         let run_logger = self.logger.for_run();
         let logger = PluginLogger::production(run_logger.clone());
-        let trigger_arguments = self.trigger_definition.trigger_arguments.clone();
+        let trigger_arguments = self.plugin_trigger_arguments();
         let py_cache = self.trigger_cache();
         let plugin_code = self.plugin_code.code();
         let plugin_root = self.plugin_code.plugin_root().cloned();
@@ -438,7 +445,7 @@ impl TriggerPlugin {
         let query_endpoint = Arc::clone(&self.query_endpoint);
         let run_logger = self.logger.for_run();
         let logger = PluginLogger::production(run_logger.clone());
-        let trigger_arguments = self.trigger_definition.trigger_arguments.clone();
+        let trigger_arguments = self.plugin_trigger_arguments();
         let py_cache = self.trigger_cache();
         let plugin_code_str = self.plugin_code.code();
         let plugin_root = self.plugin_code.plugin_root().cloned();
