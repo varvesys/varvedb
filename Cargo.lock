@@ -4059,6 +4059,7 @@ dependencies = [
  "datafusion",
  "executor",
  "futures",
+ "hashbrown 0.14.5",
  "humantime",
  "influxdb3_cache",
  "influxdb3_catalog",

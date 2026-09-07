@@ -251,6 +251,19 @@ impl ClusterConfig {
     /// `cluster_id` defaults to `node_id`, so omitting the flag reproduces the single-node layout
     /// and makes the catalog promotion a no-op.
     pub fn resolve(&self, node_id: &str) -> Result<ClusterIdentity> {
+        self.resolve_with_plugin_dir(node_id, false)
+    }
+
+    /// Like [`resolve`](Self::resolve), but `plugin_dir_configured` records whether
+    /// `--plugin-dir` / `INFLUXDB3_PLUGIN_DIR` is set. When it is, the Processing Engine is
+    /// active on this node, so `process` is added to its registered modes — it is a consequence
+    /// of the flag, not an operator-selected role, so it is not subject to the `--mode`
+    /// combination rules (a `--mode compact --plugin-dir …` node is legitimately `[Compact, Process]`).
+    pub fn resolve_with_plugin_dir(
+        &self,
+        node_id: &str,
+        plugin_dir_configured: bool,
+    ) -> Result<ClusterIdentity> {
         validate_identifier("node-id", node_id)?;
         let cluster_id = match self.cluster_id.as_deref() {
             Some(cluster_id) => {
@@ -260,7 +273,7 @@ impl ClusterConfig {
             None => node_id,
         };
 
-        let modes = resolve_modes(&self.mode, cluster_id != node_id)?;
+        let modes = resolve_modes(&self.mode, cluster_id != node_id, plugin_dir_configured)?;
 
         Ok(ClusterIdentity {
             node_id: Arc::from(node_id),
@@ -280,7 +293,11 @@ impl ClusterConfig {
 /// The catalog accepts any combination without complaint — `From<Vec<NodeMode>> for NodeModes` just
 /// collects into a set — so every meaningful check has to happen here, before a node registers
 /// itself into a state nothing downstream will question.
-fn resolve_modes(requested: &[CliNodeMode], is_clustered: bool) -> Result<Vec<NodeMode>> {
+fn resolve_modes(
+    requested: &[CliNodeMode],
+    is_clustered: bool,
+    plugin_dir_configured: bool,
+) -> Result<Vec<NodeMode>> {
     // An empty list registers a node that is neither an ingester nor a querier. The catalog permits
     // it and it starts up cleanly, then silently does nothing useful.
     if requested.is_empty() {
@@ -343,7 +360,21 @@ fn resolve_modes(requested: &[CliNodeMode], is_clustered: bool) -> Result<Vec<No
         });
     }
 
-    Ok(modes.into_iter().map(NodeMode::from).collect())
+    let mut resolved: Vec<NodeMode> = modes.into_iter().map(NodeMode::from).collect();
+
+    // `--plugin-dir` activates the Processing Engine, which in a cluster means this node runs
+    // plugin triggers pinned to it. Record that as `process` mode so the shared catalog reflects
+    // it and trigger placement (`NodeSpec`) can target the node. Added after the combination
+    // checks above: it is not an operator-chosen role and must coexist with any of them.
+    if plugin_dir_configured
+        && !resolved
+            .iter()
+            .any(|m| matches!(m, NodeMode::Process | NodeMode::All))
+    {
+        resolved.push(NodeMode::Process);
+    }
+
+    Ok(resolved)
 }
 
 /// This node's resolved place in the cluster.
@@ -696,7 +727,7 @@ mod tests {
     fn empty_mode_list_is_rejected() {
         // The catalog accepts an empty mode vec and produces a node that is neither an ingester nor
         // a querier — it starts cleanly and then does nothing.
-        assert!(resolve_modes(&[], true).is_err());
+        assert!(resolve_modes(&[], true, false).is_err());
     }
 
     #[test]
@@ -775,5 +806,45 @@ mod tests {
             err.to_string().contains("require --cluster-id"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn plugin_dir_adds_process_mode() {
+        // Default `--mode core` + `--plugin-dir`: the engine is active, so `process` joins the
+        // node's modes. `core` alone is still valid without `--cluster-id`.
+        let identity = config(&[])
+            .resolve_with_plugin_dir("host01", true)
+            .unwrap();
+        assert_eq!(identity.modes(), vec![NodeMode::Core, NodeMode::Process]);
+        assert!(identity.processes());
+
+        // No `--plugin-dir`: unchanged.
+        assert_eq!(
+            config(&[]).resolve_with_plugin_dir("host01", false).unwrap().modes(),
+            vec![NodeMode::Core],
+        );
+    }
+
+    #[test]
+    fn plugin_dir_process_coexists_with_exclusive_modes_and_dedups() {
+        // `compact` is otherwise exclusive, but the auto-added `process` is a flag consequence,
+        // not an operator role, so it coexists.
+        let identity = config(&["--cluster-id", "c", "--mode", "compact"])
+            .resolve_with_plugin_dir("host01", true)
+            .unwrap();
+        assert_eq!(identity.modes(), vec![NodeMode::Compact, NodeMode::Process]);
+        assert!(identity.compacts() && identity.processes());
+
+        // Explicit `--mode process` + `--plugin-dir` does not double up.
+        let identity = config(&["--cluster-id", "c", "--mode", "ingest,process"])
+            .resolve_with_plugin_dir("host01", true)
+            .unwrap();
+        assert_eq!(identity.modes(), vec![NodeMode::Ingest, NodeMode::Process]);
+
+        // `all` already covers process — nothing appended.
+        let identity = config(&["--cluster-id", "c", "--mode", "all"])
+            .resolve_with_plugin_dir("host01", true)
+            .unwrap();
+        assert_eq!(identity.modes(), vec![NodeMode::All]);
     }
 }

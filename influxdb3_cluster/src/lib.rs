@@ -52,6 +52,7 @@ pub mod config;
 pub mod file_index;
 
 pub mod init;
+pub mod pe_placement;
 pub mod peer_chunk;
 pub mod rpc;
 
@@ -61,6 +62,7 @@ pub use config::{
 };
 pub use file_index::FileIndex;
 pub use init::{init_catalog, wrap_write_buffer};
+pub use pe_placement::trigger_placement;
 
 /// A [`WriteBuffer`] that answers queries from this node's data **and** peers' persisted Parquet.
 ///

@@ -932,7 +932,11 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
 
     let node_id: Arc<str> = Arc::from(config.get_node_id()?);
     // Validates both identifiers and resolves the cluster id, which defaults to the node id.
-    let cluster = config.cluster.resolve(&node_id)?;
+    // `--plugin-dir` activates the Processing Engine, which adds `process` to this node's modes.
+    let cluster = config.cluster.resolve_with_plugin_dir(
+        &node_id,
+        config.processing_engine_config.plugin_dir.is_some(),
+    )?;
 
     let max_concurrent_queries = config.max_concurrent_queries.0;
 
@@ -1438,6 +1442,19 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
         None
     };
 
+    let mut pe_options = ProcessingEngineManagerOptions::new()
+        .with_plugin_trigger_invocation_registry(Some(plugin_trigger_invocation_registry))
+        .with_async_trigger_concurrency_limit(
+            config
+                .processing_engine_config
+                .async_trigger_concurrency_limit,
+        );
+    // Only a clustered node needs cluster-aware trigger placement; single-node keeps the core
+    // default (run every trigger with no node targeting).
+    if cluster.is_clustered() {
+        pe_options =
+            pe_options.with_placement(influxdb3_cluster::trigger_placement(write_buffer.catalog()));
+    }
     let processing_engine = ProcessingEngineManagerImpl::new_with_options(
         processing_engine_env,
         write_buffer.catalog(),
@@ -1447,13 +1464,7 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
         )),
         Arc::new(InProcessQueryEndpoint::new(Arc::clone(&query_executor) as _)),
         Arc::clone(&time_provider) as _,
-        ProcessingEngineManagerOptions::new()
-            .with_plugin_trigger_invocation_registry(Some(plugin_trigger_invocation_registry))
-            .with_async_trigger_concurrency_limit(
-                config
-                    .processing_engine_config
-                    .async_trigger_concurrency_limit,
-            ),
+        pe_options,
     )
     .await
     .map_err(Error::PythonEnvironmentInitialization)?;
