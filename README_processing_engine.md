@@ -346,7 +346,10 @@ is `node_spec` reaches the plugin with `args=None`, exactly as if none were set.
 * **Placement is evaluated at startup and on trigger create/enable/disable.** A node added
   to an existing trigger's `node_spec` picks the trigger up only after it restarts.
 * **No create-time validation.** A bad `node_spec` (unknown node id, or a WAL trigger on a
-  non-ingest node) is a warning + no-run at trigger start, not a `create trigger` error.
+  non-ingest node) is a warning + no-run at trigger start, not a `create trigger` error. The
+  warning names the specific unresolved entries (`unknown_nodes=…`); note that a node that
+  has only just joined can appear there briefly until its registration propagates to the
+  node logging the warning.
 
 ### Recommended pattern
 

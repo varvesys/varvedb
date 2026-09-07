@@ -26,6 +26,7 @@ use influxdb3_catalog::catalog::{
 use influxdb3_catalog::enterprise::trigger_placement::{
     NODE_SPEC_TRIGGER_ARGUMENT as NODE_SPEC_ARG, TriggerPlacement,
 };
+use influxdb3_id::NodeId;
 use observability_deps::tracing::warn;
 
 /// The placement a trigger's `node_spec` argument asks for, before catalog resolution.
@@ -90,18 +91,20 @@ impl TriggerPlacement for ClusterPlacement {
         };
 
         // Resolve node names -> catalog ids (upstream `resolve_node_spec` is private).
-        let Some(ids) = names
-            .iter()
-            .map(|name| self.catalog.node(name).map(|n| n.node_catalog_id()))
-            .collect::<Option<Vec<_>>>()
-        else {
+        let (ids, unknown) = self.resolve_node_names(&names);
+        if !unknown.is_empty() {
+            // Name the offending entries specifically — with a long `node_spec` an operator
+            // should not have to diff the list to find the typo. A newly-joined node that has
+            // not yet propagated to this catalog replica lands here too, hence the hedge.
             warn!(
-                node_spec = names.join(","),
                 trigger = trigger.trigger_name.as_ref(),
-                "node_spec names a node not in the cluster catalog; not running trigger here"
+                unknown_nodes = unknown.join(","),
+                node_spec = names.join(","),
+                "node_spec names node(s) not in this catalog view; not running this trigger here \
+                 (check for a typo — a newly-joined node may also not have propagated yet)"
             );
             return false;
-        };
+        }
 
         match self.catalog.matches_node_spec(&NodeSpec::Nodes(ids)) {
             Ok(true) => self.type_ok(trigger),
@@ -120,6 +123,21 @@ impl TriggerPlacement for ClusterPlacement {
 }
 
 impl ClusterPlacement {
+    /// Split `names` into the catalog ids they resolve to and the names this node's catalog
+    /// view has never heard of. Every name is checked, so the warning can list all typos at
+    /// once rather than surfacing them one restart at a time.
+    fn resolve_node_names(&self, names: &[String]) -> (Vec<NodeId>, Vec<String>) {
+        let mut ids = Vec::with_capacity(names.len());
+        let mut unknown = Vec::new();
+        for name in names {
+            match self.catalog.node(name) {
+                Some(node) => ids.push(node.node_catalog_id()),
+                None => unknown.push(name.clone()),
+            }
+        }
+        (ids, unknown)
+    }
+
     /// A WAL trigger only sees writes from the node it runs on. If placement lands it on a node
     /// that never ingests, it can never fire — say so and don't start it. (v1 rejected this at
     /// create time; this is the runtime equivalent.)
@@ -282,6 +300,27 @@ mod tests {
             &catalog,
             &trigger(&[("node_spec", "nodes:i1,ghost")])
         ));
+    }
+
+    #[tokio::test]
+    async fn resolve_node_names_reports_exactly_the_unknown_names() {
+        let catalog = cluster_catalog(
+            "i1",
+            &[("i1", &[NodeMode::Ingest]), ("i2", &[NodeMode::Ingest])],
+        )
+        .await;
+        let placement = ClusterPlacement { catalog };
+
+        let (ids, unknown) = placement.resolve_node_names(&["i1".into(), "i2".into()]);
+        assert_eq!(ids.len(), 2);
+        assert!(unknown.is_empty());
+
+        // The known node is resolved; only the typo is called out — every name is checked, so
+        // both bad entries surface together rather than one restart at a time.
+        let (ids, unknown) = placement
+            .resolve_node_names(&["i1".into(), "ghost".into(), "gohst".into()]);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(unknown, vec!["ghost".to_string(), "gohst".to_string()]);
     }
 
     #[tokio::test]
