@@ -140,6 +140,12 @@ pub enum Error {
     #[error("cannot write to a compactor-only server")]
     NoWriteInCompactorOnly,
 
+    #[error(
+        "this node runs in query-only mode and does not accept writes; send writes to a node \
+         started with --mode ingest"
+    )]
+    NodeIsQueryOnly,
+
     #[error("error: {0}")]
     AnyhowError(#[from] anyhow::Error),
 
@@ -460,6 +466,15 @@ impl WriteBufferImpl {
         Arc::clone(&self.persisted_files)
     }
 
+    /// The in-memory buffer holding writes that have not yet been persisted as Parquet.
+    ///
+    /// Exposed so that a cluster node can serve *only* its un-persisted rows to peers. Peers index
+    /// each other's Parquet independently, so serving `get_table_chunks` (buffer + Parquet) instead
+    /// would double-count.
+    pub fn buffer(&self) -> Arc<QueryableBuffer> {
+        Arc::clone(&self.buffer)
+    }
+
     async fn write_lp(
         &self,
         db_name: DatabaseName,
@@ -582,7 +597,7 @@ impl WriteBufferImpl {
         let span_ctx = ctx.span_ctx().map(|span| span.child("table_chunks"));
         let mut recorder = SpanRecorder::new(span_ctx);
 
-        let mut chunks = self.buffer.get_table_chunks(
+        let (mut chunks, parquet_files) = self.buffer.get_table_chunks_and_parquet_files(
             Arc::clone(&db_schema),
             Arc::clone(&table_def),
             filter,
@@ -595,9 +610,6 @@ impl WriteBufferImpl {
             MetaValue::Int(num_chunks_from_buffer as i64),
         );
 
-        let parquet_files =
-            self.persisted_files
-                .get_files_filtered(db_schema.id, table_def.table_id, filter);
         let num_parquet_files_needed = parquet_files.len();
         recorder.set_metadata(
             "parquet_files",
@@ -696,7 +708,7 @@ pub fn cache_parquet_files<T: AsRef<ParquetFile>>(
                 // cache might be handy for this case.
                 let f: &ParquetFile = file.borrow().as_ref();
                 let (cache_req, receiver) = CacheRequest::create_eventual_mode_cache_request(
-                    ObjPath::from(f.path.as_str()),
+                    ObjPath::from(f.path.as_ref()),
                     Some(f.timestamp_min_max()),
                 );
                 parquet_cache.register(cache_req);

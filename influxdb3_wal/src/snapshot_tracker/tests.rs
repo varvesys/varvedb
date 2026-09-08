@@ -136,3 +136,66 @@ fn snapshot_future_data_forces_snapshot() {
         })
     );
 }
+
+#[test]
+fn reserve_snapshot_sequence_number_advances_monotonically() {
+    let mut tracker = SnapshotTracker::new(2, Gen1Duration::new_1m(), None);
+    assert_eq!(
+        tracker.last_snapshot_sequence_number(),
+        SnapshotSequenceNumber::new(0)
+    );
+
+    let first = tracker.reserve_snapshot_sequence_number();
+    let second = tracker.reserve_snapshot_sequence_number();
+
+    assert_eq!(first, SnapshotSequenceNumber::new(1));
+    assert_eq!(second, SnapshotSequenceNumber::new(2));
+    assert_eq!(tracker.last_snapshot_sequence_number(), second);
+}
+
+#[test]
+fn a_reservation_is_never_reused_by_a_real_snapshot() {
+    // This is the whole point of reserving rather than reading-and-adding-one. A caller that merely
+    // read `last_snapshot_sequence_number` and added one would hand the same number to the flush
+    // path, and `persist_snapshot` is an unconditional PUT — so whichever manifest was written first
+    // would be silently destroyed.
+    let mut tracker = SnapshotTracker::new(1, Gen1Duration::new_1m(), None);
+
+    let reserved = tracker.reserve_snapshot_sequence_number();
+
+    for i in 1..=3 {
+        tracker.add_wal_period(WalPeriod::new(
+            WalFileSequenceNumber::new(i),
+            Timestamp::new((i as i64 - 1) * 60_000000000),
+            Timestamp::new(i as i64 * 60_000000000),
+        ));
+    }
+
+    let details = tracker
+        .snapshot(false)
+        .expect("enough wal periods to snapshot");
+
+    assert_ne!(
+        details.snapshot_sequence_number, reserved,
+        "a real snapshot must not reuse a reserved number"
+    );
+    assert!(
+        details.snapshot_sequence_number > reserved,
+        "the tracker only moves forward: got {:?} after reserving {:?}",
+        details.snapshot_sequence_number,
+        reserved
+    );
+}
+
+#[test]
+fn an_unused_reservation_only_leaves_a_gap() {
+    // Nothing downstream requires contiguity — replay compares a WAL file's recorded sequence
+    // against the pre-replay high-water mark, and every other consumer orders by `>` alone.
+    let mut tracker = SnapshotTracker::new(1, Gen1Duration::new_1m(), None);
+
+    let _abandoned = tracker.reserve_snapshot_sequence_number();
+    let next = tracker.reserve_snapshot_sequence_number();
+
+    assert_eq!(next, SnapshotSequenceNumber::new(2));
+    assert_eq!(tracker.last_snapshot_sequence_number(), next);
+}

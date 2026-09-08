@@ -89,7 +89,7 @@ fn test_get_files_with_filters() {
             let chunk_time = i;
             ParquetFile {
                 id: ParquetFileId::new(),
-                path: format!("/path/{i:03}.parquet"),
+                path: format!("/path/{i:03}.parquet").into(),
                 size_bytes: 1,
                 row_count: 1,
                 chunk_time,
@@ -231,7 +231,7 @@ fn build_parquet_files(prefix: &str, num_files: u32) -> Vec<ParquetFile> {
     let parquet_files: Vec<ParquetFile> = (0..num_files)
         .map(|i| ParquetFile {
             id: ParquetFileId::new(),
-            path: format!("/random/path/{prefix}_{i}.parquet"),
+            path: format!("/random/path/{prefix}_{i}.parquet").into(),
             size_bytes: 50_000,
             row_count: 10,
             chunk_time: 10,
@@ -439,7 +439,7 @@ fn test_new_from_checkpoints_with_pending_removed() {
     // Create a file that exists in January
     let jan_file = ParquetFile {
         id: ParquetFileId::new(),
-        path: "/jan/file.parquet".to_string(),
+        path: "/jan/file.parquet".into(),
         size_bytes: 50_000,
         row_count: 10,
         chunk_time: 10,
@@ -502,7 +502,7 @@ fn test_new_from_checkpoints_pending_removed_missing_db() {
     // Create a pending_removed that references a non-existent database
     let missing_file = ParquetFile {
         id: ParquetFileId::new(),
-        path: "/missing/file.parquet".to_string(),
+        path: "/missing/file.parquet".into(),
         size_bytes: 50_000,
         row_count: 10,
         chunk_time: 10,
@@ -519,4 +519,182 @@ fn test_new_from_checkpoints_pending_removed_missing_db() {
 
     let (file_count, _, _) = persisted_files.get_metrics();
     assert_eq!(0, file_count);
+}
+
+#[test]
+fn test_apply_compaction_swaps_inputs_for_merged_file() {
+    let inputs = build_parquet_files("input_", 4);
+    let snapshot = build_snapshot(inputs.clone(), 1, 1, 1);
+    let persisted_files =
+        PersistedFiles::new_from_persisted_snapshots(None, Arc::new(vec![snapshot]));
+
+    let db_id = DbId::from(0);
+    let table_id = TableId::from(0);
+    assert_eq!(persisted_files.get_files(db_id, table_id).len(), 4);
+
+    // Merge the first three; the fourth is untouched and must survive.
+    let removed_paths: Vec<String> = inputs[..3].iter().map(|f| f.path.to_string()).collect();
+    let merged = ParquetFile {
+        id: ParquetFileId::from(90_001),
+        path: "/random/path/merged.parquet".into(),
+        size_bytes: 140_000,
+        row_count: 30,
+        chunk_time: 10,
+        min_time: 10,
+        max_time: 200,
+    };
+
+    let (added, removed) = persisted_files.apply_compaction(
+        db_id,
+        table_id,
+        std::slice::from_ref(&merged),
+        &removed_paths,
+    );
+    assert_eq!(added, 1);
+    assert_eq!(removed.len(), 3);
+
+    // The returned records must carry this node's own ids: the caller puts them in a snapshot's
+    // `removed_files`, and the table index prunes by `ParquetFileId`, not by path.
+    let mut removed_ids: Vec<_> = removed.iter().map(|f| f.id).collect();
+    removed_ids.sort();
+    let mut expected_ids: Vec<_> = inputs[..3].iter().map(|f| f.id).collect();
+    expected_ids.sort();
+    assert_eq!(removed_ids, expected_ids);
+
+    let files = persisted_files.get_files(db_id, table_id);
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().any(|f| f.path == merged.path));
+    assert!(files.iter().any(|f| f.path == inputs[3].path));
+    for input in &inputs[..3] {
+        assert!(
+            !files.iter().any(|f| f.path == input.path),
+            "{} should have been swapped out",
+            input.path
+        );
+    }
+
+    // Metrics must track the swap, not just the addition.
+    let (file_count, _size_mb, row_count) = persisted_files.get_metrics();
+    assert_eq!(file_count, 2);
+    assert_eq!(
+        row_count,
+        10 + 30,
+        "one surviving input plus the merged file"
+    );
+}
+
+#[test]
+fn test_apply_compaction_is_idempotent() {
+    // A compaction notice carries a pointer to a durable snapshot and may be delivered more than
+    // once — on retry, or after the peer already applied it. Re-applying must not double-count.
+    let inputs = build_parquet_files("input_", 3);
+    let snapshot = build_snapshot(inputs.clone(), 1, 1, 1);
+    let persisted_files =
+        PersistedFiles::new_from_persisted_snapshots(None, Arc::new(vec![snapshot]));
+
+    let db_id = DbId::from(0);
+    let table_id = TableId::from(0);
+    let removed_paths: Vec<String> = inputs.iter().map(|f| f.path.to_string()).collect();
+    let merged = ParquetFile {
+        id: ParquetFileId::from(90_002),
+        path: "/random/path/merged.parquet".into(),
+        size_bytes: 140_000,
+        row_count: 30,
+        chunk_time: 10,
+        min_time: 10,
+        max_time: 200,
+    };
+
+    let first = persisted_files.apply_compaction(
+        db_id,
+        table_id,
+        std::slice::from_ref(&merged),
+        &removed_paths,
+    );
+    assert_eq!(first.0, 1);
+    assert_eq!(first.1.len(), 3);
+
+    // Redeliver with a **freshly minted id**, which is what actually happens: the receiver calls
+    // `notice.merged_file(ParquetFileId::new())` on every notice, so the second delivery is never
+    // the same record as the first. Reusing `merged` here would compare equal on every field and
+    // pass no matter how identity was decided — the test would agree with a broken implementation.
+    let redelivered = ParquetFile {
+        id: ParquetFileId::from(90_003),
+        ..merged.clone()
+    };
+    let second = persisted_files.apply_compaction(
+        db_id,
+        table_id,
+        std::slice::from_ref(&redelivered),
+        &removed_paths,
+    );
+    // The receiver detects a redelivery from this alone — nothing added, nothing removed — which is
+    // what lets it skip writing a second snapshot and burning a sequence number to say nothing.
+    assert_eq!(second.0, 0, "replay must add nothing");
+    assert!(second.1.is_empty(), "replay must remove nothing");
+
+    let (file_count, _, row_count) = persisted_files.get_metrics();
+    assert_eq!(file_count, 1, "same path must not be counted twice");
+    assert_eq!(row_count, 30);
+}
+
+/// Startup loads snapshots **newest-first**, but a snapshot's `removed_files` names files that
+/// *earlier* snapshots added. Folding in load order applies the removal first, where it matches
+/// nothing and is silently dropped, and the older snapshot then re-adds the file. Every compacted
+/// input comes back — and the compactor has already deleted those objects, so the node serves
+/// paths that do not exist and queries fail with `NotFound`.
+///
+/// Reproduced live: a node restarting after compaction resurrected all 19 of its removed inputs.
+#[test_log::test(test)]
+fn removals_survive_snapshots_loaded_newest_first() {
+    // Explicit ids, not `ParquetFileId::new()`: that mints from a global counter, and
+    // `next_id_is_correct_number` and `new_snapshots_use_correct_sequence` assert on its exact
+    // value, so a test that consumes ids fails them when the suite runs in parallel.
+    let parquet = |id: u64, name: &str| ParquetFile {
+        id: ParquetFileId::from(id),
+        path: format!("/random/path/{name}.parquet").into(),
+        size_bytes: 50_000,
+        row_count: 10,
+        chunk_time: 10,
+        min_time: 10,
+        max_time: 200,
+    };
+    let inputs: Vec<ParquetFile> = (0..3).map(|i| parquet(900 + i, &format!("input_{i}"))).collect();
+    let merged = vec![parquet(910, "merged_0")];
+
+    // seq 1..3: one input each, the way ordinary persistence writes them.
+    let adds: Vec<PersistedSnapshot> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| build_snapshot(vec![f.clone()], i as u64 + 1, i as u64 + 1, 1))
+        .collect();
+
+    // seq 4: the compaction swap — adds the merged file, removes all three inputs.
+    let mut swap = build_snapshot(merged.clone(), 4, 4, 1);
+    swap.removed_files = build_snapshot(inputs.clone(), 4, 4, 1).databases;
+
+    // Hand them over newest-first, exactly as `load_snapshots` returns them.
+    let mut newest_first = vec![swap];
+    newest_first.extend(adds.into_iter().rev());
+    assert_eq!(
+        newest_first
+            .iter()
+            .map(|s| s.snapshot_sequence_number.as_u64())
+            .collect::<Vec<_>>(),
+        vec![4, 3, 2, 1],
+        "the fixture must be newest-first, or it does not test the bug"
+    );
+
+    for persisted in [
+        PersistedFiles::new_from_persisted_snapshots(None, Arc::new(newest_first.clone())),
+        PersistedFiles::new_from_checkpoints_and_snapshots(None, vec![], newest_first),
+    ] {
+        let files = persisted.get_files(DbId::from(0), TableId::from(0));
+        let paths: Vec<String> = files.iter().map(|f| f.path.to_string()).collect();
+        assert_eq!(
+            paths,
+            vec![merged[0].path.to_string()],
+            "compacted-away inputs must stay removed; they no longer exist in object store"
+        );
+    }
 }

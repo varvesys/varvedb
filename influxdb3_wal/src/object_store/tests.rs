@@ -7,6 +7,7 @@ use indexmap::IndexMap;
 use influxdb3_id::{ColumnId, DbId, TableId};
 use iox_time::{MockProvider, Time};
 use object_store::memory::InMemory;
+use object_store_utils::{LostResponseError, LostResponseStore, SelfVerifyingCreateStore};
 use rustc_hash::FxHasher;
 use std::any::Any;
 use std::hash::BuildHasherDefault;
@@ -776,6 +777,114 @@ async fn test_wal_file_removal_after_snapshot() {
     assert!(object_store.get(&path3).await.ok().is_some());
 }
 
+/// `last_persisted_wal_sequence_number` is the replay watermark: it tracks what a completed
+/// snapshot has persisted, NOT the newest WAL file that exists. Flushing WAL files advances
+/// `last_wal_sequence_number` but must leave the persisted watermark untouched — only
+/// `cleanup_snapshot` moves it. A compaction snapshot stamps its `wal_file_sequence_number` with
+/// this value; stamping the newer one instead makes a restart skip un-persisted WAL files.
+#[test_log::test(tokio::test)]
+async fn last_persisted_wal_sequence_number_only_advances_on_snapshot() {
+    let time_provider: Arc<dyn TimeProvider> =
+        Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let notifier: Arc<dyn WalFileNotifier> = Arc::new(TestNotifier::default());
+    // snapshot_size high enough that plain flushes below never trigger a snapshot themselves.
+    let wal_config = WalConfig {
+        max_write_buffer_size: 100,
+        flush_interval: Duration::from_secs(1),
+        snapshot_size: 10,
+        gen1_duration: Gen1Duration::new_1m(),
+        ..Default::default()
+    };
+    let wal = WalObjectStore::new_without_replay(
+        Arc::clone(&time_provider),
+        Arc::clone(&object_store),
+        "my_host",
+        Arc::clone(&notifier),
+        wal_config,
+        None, // last_wal_sequence_number: node has never persisted a snapshot
+        None, // last_snapshot_sequence_number
+        &[],
+        1,
+        CancellationToken::new(),
+    );
+
+    let write_op = |t: i64| {
+        WalOp::Write(WriteBatch {
+            catalog_sequence: 0,
+            database_id: DbId::from(0),
+            database_name: "db".into(),
+            table_chunks: fx_index_map([(
+                TableId::from(0),
+                TableChunks {
+                    min_time: t,
+                    max_time: t,
+                    chunk_time_to_chunk: HashMap::from([(
+                        0,
+                        TableChunk {
+                            rows: vec![Row {
+                                time: t,
+                                fields: vec![Field {
+                                    id: ColumnId::from(0),
+                                    value: FieldData::Integer(1),
+                                }],
+                            }],
+                        },
+                    )]),
+                },
+            )])
+            .into(),
+            min_time_ns: t,
+            max_time_ns: t,
+        })
+    };
+
+    // Never snapshotted -> watermark is 0: a restart would replay every WAL file.
+    assert_eq!(
+        wal.last_persisted_wal_sequence_number().await,
+        WalFileSequenceNumber::new(0)
+    );
+
+    // Flush three WAL files. The newest-file counter climbs; the persisted watermark does not.
+    for t in 1..=3 {
+        wal.write_ops_unconfirmed(vec![write_op(t)]).await.unwrap();
+        wal.flush_buffer(false).await;
+    }
+    assert_eq!(
+        wal.last_wal_sequence_number().await,
+        WalFileSequenceNumber::new(3),
+        "flushing advances the newest-WAL-file counter"
+    );
+    assert_eq!(
+        wal.last_persisted_wal_sequence_number().await,
+        WalFileSequenceNumber::new(0),
+        "no snapshot has completed, so nothing is persisted: the replay watermark stays at 0"
+    );
+
+    // A completed snapshot that persisted WAL files 1..=2 advances the watermark to 2 — and no
+    // further: file 3 is still only in the WAL.
+    let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+    wal.cleanup_snapshot(
+        SnapshotDetails {
+            snapshot_sequence_number: SnapshotSequenceNumber::new(1),
+            end_time_marker: 10,
+            first_wal_sequence_number: WalFileSequenceNumber::new(1),
+            last_wal_sequence_number: WalFileSequenceNumber::new(2),
+            forced: false,
+        },
+        permit,
+    )
+    .await;
+    assert_eq!(
+        wal.last_persisted_wal_sequence_number().await,
+        WalFileSequenceNumber::new(2)
+    );
+    assert!(
+        wal.last_persisted_wal_sequence_number().await <= wal.last_wal_sequence_number().await,
+        "the replay watermark is never ahead of the newest WAL file"
+    );
+}
+
 #[test_log::test(tokio::test)]
 async fn test_wal_file_removal_after_snapshot_worked_out_example() {
     // Say we snapshot every 5 files, and we always want to keep around at least 10 snapshotted files.
@@ -903,4 +1012,133 @@ impl WalFileNotifier for TestNotifier {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Build a WAL over `inner` wrapped in the verifying layer.
+fn verifying_wal_over(inner: Arc<dyn ObjectStore>) -> (WalObjectStore, CancellationToken) {
+    let registry = metric::Registry::new();
+    wal_over(Arc::new(SelfVerifyingCreateStore::new(inner, &registry)))
+}
+
+/// Build a WAL over `object_store`, returning the WAL and the shutdown token it
+/// will cancel if it decides a foreign writer holds the path.
+fn wal_over(object_store: Arc<dyn ObjectStore>) -> (WalObjectStore, CancellationToken) {
+    let time_provider: Arc<dyn TimeProvider> =
+        Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
+    let notifier: Arc<dyn WalFileNotifier> = Arc::new(TestNotifier::default());
+    let shutdown = CancellationToken::new();
+    let wal = WalObjectStore::new_without_replay(
+        time_provider,
+        object_store,
+        "my_host",
+        notifier,
+        WalConfig {
+            max_write_buffer_size: 100,
+            flush_interval: Duration::from_secs(1),
+            snapshot_size: 2,
+            gen1_duration: Gen1Duration::new_1m(),
+            ..Default::default()
+        },
+        None,
+        None,
+        &[],
+        1,
+        shutdown.clone(),
+    );
+    (wal, shutdown)
+}
+
+/// A single write op, enough to fill the WAL buffer so a flush persists a file.
+fn op() -> WalOp {
+    WalOp::Write(WriteBatch {
+        catalog_sequence: 0,
+        database_id: DbId::from(0),
+        database_name: "db1".into(),
+        table_chunks: fx_index_map([(
+            TableId::from(0),
+            TableChunks {
+                min_time: 1,
+                max_time: 1,
+                chunk_time_to_chunk: HashMap::from([(
+                    0,
+                    TableChunk {
+                        rows: vec![Row {
+                            time: 1,
+                            fields: vec![
+                                Field {
+                                    id: ColumnId::from(0),
+                                    value: FieldData::Integer(1),
+                                },
+                                Field {
+                                    id: ColumnId::from(1),
+                                    value: FieldData::Timestamp(1),
+                                },
+                            ],
+                        }],
+                    },
+                )]),
+            },
+        )])
+        .into(),
+        min_time_ns: 1,
+        max_time_ns: 1,
+    })
+}
+
+/// The bug from EAR 7005: the PUT is applied, the response is lost, the
+/// client's own retry gets 412. The node must not shut down.
+#[tokio::test]
+async fn own_lost_put_response_is_not_a_duplicate_writer() {
+    let inner = Arc::new(LostResponseStore::new(Arc::new(InMemory::new())));
+    let (wal, shutdown) = verifying_wal_over(Arc::clone(&inner) as _);
+
+    wal.write_ops_unconfirmed(vec![op()]).await.unwrap();
+    inner.lose_next_put_response_with(LostResponseError::AlreadyExists);
+
+    let flushed = wal.flush_buffer(true).await;
+
+    assert!(!shutdown.is_cancelled(), "node shut down on its own write");
+    assert!(
+        flushed.is_some(),
+        "flush reported failure for a durable write"
+    );
+}
+
+/// Control: without the verifying layer, the same scenario still shuts the node
+/// down. This proves the test above detects the bug, and that a store left
+/// unwrapped is unchanged.
+#[tokio::test]
+async fn an_unwrapped_store_still_shuts_down_on_a_lost_put_response() {
+    let inner = Arc::new(LostResponseStore::new(Arc::new(InMemory::new())));
+    let (wal, shutdown) = wal_over(Arc::clone(&inner) as _);
+
+    wal.write_ops_unconfirmed(vec![op()]).await.unwrap();
+    inner.lose_next_put_response_with(LostResponseError::AlreadyExists);
+
+    let flushed = wal.flush_buffer(true).await;
+
+    assert!(shutdown.is_cancelled());
+    assert!(flushed.is_none());
+}
+
+/// The WAL's own 100x retry loop re-issues the create. A nonce minted per
+/// `put_opts` call would be fresh on the second attempt and read the first
+/// attempt's nonce as foreign; a nonce minted per WAL file covers it.
+#[tokio::test]
+async fn outer_retry_loop_is_covered_by_the_per_file_nonce() {
+    let inner = Arc::new(LostResponseStore::new(Arc::new(InMemory::new())));
+    let (wal, shutdown) = verifying_wal_over(Arc::clone(&inner) as _);
+
+    wal.write_ops_unconfirmed(vec![op()]).await.unwrap();
+    // First attempt lands but returns a retryable error, so the WAL's own loop
+    // re-enters put_opts; the second attempt collides with attempt one.
+    inner.lose_next_put_response_with(LostResponseError::Generic);
+
+    let flushed = wal.flush_buffer(true).await;
+
+    assert!(
+        !shutdown.is_cancelled(),
+        "outer-loop retry shut the node down"
+    );
+    assert!(flushed.is_some());
 }

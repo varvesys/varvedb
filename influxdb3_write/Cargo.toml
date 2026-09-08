@@ -67,6 +67,7 @@ serde_json.workspace = true
 serde_with.workspace = true
 sha2.workspace = true
 snap.workspace = true
+siphasher.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
@@ -77,6 +78,7 @@ regex.workspace = true
 [dev-dependencies]
 # Core Crates
 arrow_util = { path = "../core/arrow_util" }
+object_store_utils = { path = "../object_store_utils", features = ["test-helpers"] }
 query_functions = { path = "../core/query_functions" }
 test_helpers = { path = "../core/test_helpers" }
 influxdb3_catalog = { path = "../influxdb3_catalog", features = [ "test_helpers" ] }
@@ -92,4 +94,8 @@ criterion.workspace = true
 
 [[bench]]
 name = "persisted_files_bench"
+harness = false
+
+[[bench]]
+name = "table_buffer_bench"
 harness = false

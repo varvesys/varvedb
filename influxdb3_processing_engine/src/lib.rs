@@ -7,9 +7,10 @@ use anyhow::{Context, anyhow};
 use bytes::Bytes;
 use hashbrown::HashMap;
 use influxdb3_catalog::catalog::{
-    Catalog, CatalogEvent, CatalogUpdateReceiver, NodeSpec, PluginType,
-    TriggerSpecificationDefinition, ValidPluginFilename,
+    Catalog, CatalogEvent, CatalogUpdateReceiver, PluginType, TriggerSpecificationDefinition,
+    ValidPluginFilename,
 };
+use influxdb3_catalog::enterprise::trigger_placement::{DefaultTriggerPlacement, TriggerPlacement};
 use influxdb3_id::{DbId, TriggerId};
 use influxdb3_py_api::cache::CacheStore;
 use influxdb3_py_api::logging::PROCESSING_ENGINE_LOGS_TABLE_NAME;
@@ -119,10 +120,14 @@ pub struct ProcessingEngineManagerImpl {
     time_provider: Arc<dyn TimeProvider>,
     cache: Arc<Mutex<CacheStore>>,
     scheduler: scheduler::Scheduler,
+    worker: Arc<worker::local::PythonTriggerWorker>,
     /// Maximum concurrent invocations per `run_async` trigger; `NonZeroUsize::MAX`
     /// means unlimited.
     async_trigger_concurrency_limit: NonZeroUsize,
     trigger_registry: RwLock<TriggerRegistry>,
+    /// Decides which triggers this node runs. Core: [`DefaultTriggerPlacement`] (only triggers
+    /// with no node targeting). A cluster build injects its own via `with_placement`.
+    placement: Arc<dyn TriggerPlacement>,
     /// Cancelled when the server begins shutting down. Passed into each plugin
     /// execution so that long-running plugins are interrupted and cannot block
     /// graceful shutdown (see influxdb_pro#2444).
@@ -135,6 +140,8 @@ pub struct ProcessingEngineManagerOptions {
     /// Maximum concurrent invocations per `run_async` trigger; `NonZeroUsize::MAX`
     /// means unlimited.
     pub async_trigger_concurrency_limit: NonZeroUsize,
+    /// Per-node trigger placement. Defaults to [`DefaultTriggerPlacement`].
+    pub placement: Arc<dyn TriggerPlacement>,
 }
 
 impl Default for ProcessingEngineManagerOptions {
@@ -148,7 +155,13 @@ impl ProcessingEngineManagerOptions {
         Self {
             plugin_trigger_invocation_registry: None,
             async_trigger_concurrency_limit: NonZeroUsize::MAX,
+            placement: Arc::new(DefaultTriggerPlacement),
         }
+    }
+
+    pub fn with_placement(mut self, placement: Arc<dyn TriggerPlacement>) -> Self {
+        self.placement = placement;
+        self
     }
 
     pub fn with_plugin_trigger_invocation_registry(
@@ -386,6 +399,7 @@ impl ProcessingEngineManagerImpl {
         let node_id = node_id.into();
         let plugin_trigger_invocation_registry = options.plugin_trigger_invocation_registry;
         let async_trigger_concurrency_limit = options.async_trigger_concurrency_limit;
+        let placement = options.placement;
         if async_trigger_concurrency_limit == NonZeroUsize::MAX {
             info!("async trigger concurrency: unlimited");
         } else {
@@ -406,9 +420,12 @@ impl ProcessingEngineManagerImpl {
             plugin_shutdown: plugin_shutdown.clone(),
             plugin_trigger_invocation_registry: plugin_trigger_invocation_registry.clone(),
         });
-        let scheduler = scheduler::Scheduler::new(Arc::clone(&node_id), |scheduler| {
-            worker.register_scheduler(scheduler);
-            vec![worker]
+        let scheduler = scheduler::Scheduler::new(Arc::clone(&node_id), {
+            let worker = Arc::clone(&worker);
+            |scheduler| {
+                worker.register_scheduler(scheduler);
+                vec![worker as _]
+            }
         });
         let pem = Arc::new(Self {
             environment_manager: environment,
@@ -417,8 +434,10 @@ impl ProcessingEngineManagerImpl {
             query_endpoint,
             time_provider,
             scheduler,
+            worker,
             async_trigger_concurrency_limit,
             trigger_registry: Default::default(),
+            placement,
             cache,
             plugin_shutdown,
         });
@@ -723,12 +742,14 @@ impl ProcessingEngineManagerImpl {
                 .ok_or(ProcessingEngineError::TriggerNotFound { db_id, trigger_id })?;
             debug!(%db_name, trigger_name = trigger.trigger_name.as_ref(), "starting trigger");
 
-            // OSS does not support multi-node; only run triggers whose node
-            // specification targets every node.
-            if !matches!(trigger.node_spec, NodeSpec::All) {
-                error!(
+            // Placement decides whether this node runs the trigger. Core: only triggers with no
+            // node targeting. A cluster build's implementation honours `node_spec` /
+            // `trigger_arguments` and logs its own reason for skipping.
+            if !self.placement.allows(&trigger) {
+                info!(
                     trigger_name = trigger.trigger_name.as_ref(),
-                    "not running trigger with an enterprise node specification"
+                    node_id = self.node_id.as_ref(),
+                    "trigger not placed on this node; skipping"
                 );
                 return Ok(());
             }
@@ -840,6 +861,7 @@ impl ProcessingEngineManagerImpl {
         self.scheduler.shutdown_trigger(key).await;
         self.trigger_registry.write().await.remove_trigger(key);
         self.cache.lock().drop_trigger_cache(db_id, trigger_id);
+        self.worker.forget_trigger(key);
 
         Ok(())
     }
@@ -1340,6 +1362,8 @@ fn background_catalog_update(
                             .scheduler
                             .shutdown_triggers_for_db(*db_id)
                             .await;
+                        // must run after scheduler shutdown
+                        processing_engine_manager.worker.forget_all_for_db(*db_id);
                         if !hard_delete_pending {
                             processing_engine_manager
                                 .trigger_registry
@@ -1358,6 +1382,8 @@ fn background_catalog_update(
                             .scheduler
                             .shutdown_triggers_for_db(*db_id)
                             .await;
+                        // must run after scheduler shutdown
+                        processing_engine_manager.worker.forget_all_for_db(*db_id);
                         processing_engine_manager
                             .trigger_registry
                             .write()

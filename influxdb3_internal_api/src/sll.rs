@@ -143,6 +143,60 @@ pub enum SystemEvent {
         duration_ms: u64,
     },
 
+    // ── parquet_cleanup ───────────────────────────────────────────────
+    /// A post-upgrade cleanup attempt completed successfully. Node-scoped:
+    /// one primary compactor walks the whole cluster object store. A dry run
+    /// reports matches while `files_deleted` and `bytes_reclaimed` remain 0.
+    ParquetCleanupSuccess {
+        /// `"delete"` or `"dry_run"`.
+        cleanup_mode: &'static str,
+        files_matched: u64,
+        bytes_matched: u64,
+        files_deleted: u64,
+        bytes_reclaimed: u64,
+        duration_ms: u64,
+    },
+    /// A post-upgrade cleanup reached a durable terminal failure. Counts
+    /// reflect progress persisted before the failure; `error_code` is a
+    /// static category and never includes an object-store path or message.
+    ParquetCleanupError {
+        cleanup_mode: &'static str,
+        files_matched: u64,
+        bytes_matched: u64,
+        files_deleted: u64,
+        bytes_reclaimed: u64,
+        error_code: &'static str,
+        duration_ms: u64,
+    },
+
+    // ── upgrade_retry ─────────────────────────────────────────────────
+    /// An operator reset of a failed Parquet → PachaTree upgrade rewrote the
+    /// durable migration state so the upgrade resumes on the next compactor
+    /// start. Cluster-wide: whichever node served the request emits it.
+    UpgradeRetrySuccess {
+        /// Terminal failures re-probed against the catalog and object store.
+        entries_inspected: u64,
+        /// Entries recorded as skips because their table or every one of
+        /// their sources is gone.
+        entries_skipped: u64,
+        /// Entries returned to the queue because a source is still readable.
+        entries_requeued: u64,
+        /// Entries whose sequence already held converted data, settled as
+        /// imported.
+        entries_already_converted: u64,
+        /// Entries left untouched because the object holding their sequence
+        /// could not be read; a re-run re-attempts them.
+        entries_unresolved: u64,
+        duration_ms: u64,
+    },
+    /// An operator reset was refused or could not be carried out. Nothing
+    /// durable changed except idempotent skip markers; `error_code` is a
+    /// static category and never includes a path or message.
+    UpgradeRetryError {
+        error_code: &'static str,
+        duration_ms: u64,
+    },
+
     // ── compaction_planned ────────────────────────────────────────────
     /// The compactor produced one or more plans for a database in this
     /// planning cycle. One emission per (cycle, database).

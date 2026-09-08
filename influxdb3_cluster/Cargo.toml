@@ -1,0 +1,52 @@
+[package]
+name = "influxdb3_cluster"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Core Crates
+influxdb3_cache = { path = "../influxdb3_cache" }
+influxdb3_catalog = { path = "../influxdb3_catalog" }
+influxdb3_id = { path = "../influxdb3_id" }
+influxdb3_process = { path = "../influxdb3_process" }
+influxdb3_shutdown = { path = "../influxdb3_shutdown" }
+influxdb3_types = { path = "../influxdb3_types" }
+influxdb3_wal = { path = "../influxdb3_wal" }
+influxdb3_write = { path = "../influxdb3_write" }
+iox_time = { path = "../core/iox_time" }
+observability_deps = { path = "../core/observability_deps" }
+iox_query = { path = "../core/iox_query" }
+schema = { path = "../core/schema" }
+data_types = { path = "../core/data_types" }
+
+# Crates.io dependencies
+arrow.workspace = true
+arrow-flight.workspace = true
+bytes.workspace = true
+executor = { path = "../core/executor" }
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tonic.workspace = true
+clap.workspace = true
+humantime.workspace = true
+metric = { path = "../core/metric" }
+thiserror.workspace = true
+async-trait.workspace = true
+datafusion.workspace = true
+object_store.workspace = true
+object_store_utils = { path = "../object_store_utils" }
+parking_lot.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+influxdb3_test_helpers = { path = "../influxdb3_test_helpers" }
+hashbrown.workspace = true
+# downsampler_e2e integration test (ignored by default); serde_json is already a dep
+reqwest = { workspace = true, features = ["blocking"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

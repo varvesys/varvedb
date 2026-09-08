@@ -19,6 +19,11 @@ use parking_lot::RwLock;
 type DatabaseToTables = HashMap<DbId, TableToFiles>;
 type TableToFiles = HashMap<TableId, Vec<ParquetFile>>;
 
+/// Put parquet files in the descending min_time order the query path expects.
+pub fn sort_by_min_time_desc(files: &mut [ParquetFile]) {
+    files.sort_by_key(|f| std::cmp::Reverse(f.min_time));
+}
+
 #[derive(Debug, Default)]
 pub struct PersistedFiles {
     inner: RwLock<Inner>,
@@ -154,6 +159,46 @@ impl PersistedFiles {
         inner.add_persisted_file(db_id, table_id, parquet_file);
     }
 
+    /// Swap a set of compacted-away input files for the merged file that replaces them.
+    ///
+    /// Called when a compactor notifies this node that it rewrote some of this node's Parquet.
+    /// Nothing else refreshes `PersistedFiles` from object store while the process runs, so without
+    /// this the node would go on naming input files that no longer exist and would never learn
+    /// about the merged file that replaced them.
+    ///
+    /// The merged file is added *before* the inputs are dropped, so the rows it covers are
+    /// advertised by one file or the other at every instant — there is no window in which a reader
+    /// taking the lock sees neither. Deleting the input objects is deliberately not done here: the
+    /// compactor owns that, and only after a grace period long enough for queries that resolved the
+    /// old paths to finish reading them.
+    ///
+    /// Inputs are matched by path, not [`ParquetFileId`]: the caller learns which files were merged
+    /// from a compactor, which never sees this node's ids. Paths are unique cluster-wide because the
+    /// node prefix is their first component, while ids are unique only per allocator.
+    ///
+    /// Returns `(files_added, removed_records)`. The removed records carry **this node's** ids, which
+    /// the caller needs to build a snapshot's `removed_files` — the table index prunes by id even
+    /// though `PeerFiles` matches by path. They cannot be looked up afterwards, since this call is
+    /// what drops them.
+    pub fn apply_compaction(
+        &self,
+        db_id: DbId,
+        table_id: TableId,
+        added: &[ParquetFile],
+        removed_paths: &[String],
+    ) -> (usize, Vec<ParquetFile>) {
+        let removed_paths: HashSet<&str> = removed_paths.iter().map(String::as_str).collect();
+        let mut inner = self.inner.write();
+        let mut added_count = 0;
+        for file in added {
+            if inner.add_compacted_file(&db_id, &table_id, file) {
+                added_count += 1;
+            }
+        }
+        let removed = inner.remove_files_by_path(&db_id, &table_id, &removed_paths);
+        (added_count, removed)
+    }
+
     /// Get the list of files for a given database and table, always return in descending order of min_time
     pub fn get_files(&self, db_id: DbId, table_id: TableId) -> Vec<ParquetFile> {
         self.get_files_filtered(db_id, table_id, &ChunkFilter::default())
@@ -168,20 +213,32 @@ impl PersistedFiles {
         table_id: TableId,
         filter: &ChunkFilter<'_>,
     ) -> Vec<ParquetFile> {
+        let mut files = self.get_files_filtered_unsorted(db_id, table_id, filter);
+        sort_by_min_time_desc(&mut files);
+        files
+    }
+
+    /// Get the list of files for a given database and table, using the provided filter to filter
+    /// results, in whatever order the index holds them.
+    pub fn get_files_filtered_unsorted(
+        &self,
+        db_id: DbId,
+        table_id: TableId,
+        filter: &ChunkFilter<'_>,
+    ) -> Vec<ParquetFile> {
         let inner = self.inner.read();
-        let mut files = inner
+        inner
             .files
             .get(&db_id)
             .and_then(|tables| tables.get(&table_id))
-            .cloned()
+            .map(|files| {
+                files
+                    .iter()
+                    .filter(|file| filter.test_time_stamp_min_max(file.min_time, file.max_time))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
-            .into_iter()
-            .filter(|file| filter.test_time_stamp_min_max(file.min_time, file.max_time))
-            .collect::<Vec<_>>();
-
-        files.sort_by_key(|f| std::cmp::Reverse(f.min_time));
-
-        files
     }
 
     /// Remove files that are marked for deletion or that violate their retention period.
@@ -190,7 +247,7 @@ impl PersistedFiles {
         catalog: Arc<Catalog>,
     ) -> SerdeVecMap<DbId, DatabaseTables> {
         let mut removed: SerdeVecMap<DbId, DatabaseTables> = SerdeVecMap::new();
-        let mut removed_paths: HashSet<String> = HashSet::new();
+        let mut removed_paths: HashSet<Arc<str>> = HashSet::new();
         let mut size = 0;
         let mut row_count = 0;
 
@@ -211,7 +268,7 @@ impl PersistedFiles {
                     .entry(table_id)
                     .or_default()
                     .push(file.clone());
-                removed_paths.insert(file.path.clone());
+                removed_paths.insert(Arc::clone(&file.path));
             };
 
             let guard = self.inner.read();
@@ -337,7 +394,16 @@ impl Inner {
         let mut size_in_mb = 0.0;
         let mut row_count = 0;
 
-        let files = persisted_snapshots.iter().fold(
+        // Fold oldest-first. Callers load snapshots newest-first (object store paths are
+        // `u64::MAX - sequence`, so a lexicographic listing descends), and each snapshot's
+        // `removed_files` refers to files added by *earlier* ones. Applying a removal before the
+        // addition it cancels makes the removal a silent no-op — `update_persisted_files_with_snapshot`
+        // matches on id and simply finds nothing — after which the older snapshot re-adds the file.
+        // Every deleted input then comes back at startup and the node serves paths that no longer
+        // exist, failing queries with `NotFound`.
+        let ordered = ordered_oldest_first(&persisted_snapshots);
+
+        let files = ordered.into_iter().fold(
             hashbrown::HashMap::new(),
             |mut files, persisted_snapshot| {
                 size_in_mb += as_mb(persisted_snapshot.parquet_size_bytes);
@@ -367,7 +433,7 @@ impl Inner {
     /// Create from checkpoints and additional (newer) snapshots.
     pub(crate) fn new_from_checkpoints_and_snapshots(
         mut checkpoints: Vec<PersistedSnapshotCheckpoint>,
-        additional_snapshots: Vec<PersistedSnapshot>,
+        mut additional_snapshots: Vec<PersistedSnapshot>,
     ) -> Self {
         debug!(
             checkpoint_count = checkpoints.len(),
@@ -387,7 +453,9 @@ impl Inner {
         // Convert merged checkpoint to Inner, or start with empty
         let mut inner = merged_checkpoint.map(Inner::from).unwrap_or_default();
 
-        // Apply additional snapshots
+        // Apply additional snapshots oldest-first: see `ordered_oldest_first`. The caller hands
+        // these over newest-first, and folding in that order resurrects every removed file.
+        additional_snapshots.sort_by_key(|s| s.snapshot_sequence_number);
         for snapshot in additional_snapshots {
             inner.add_persisted_snapshot(snapshot);
         }
@@ -439,6 +507,88 @@ impl Inner {
         }
         self.parquet_files_count += 1;
     }
+
+    /// Add a compacted file, reporting whether it was new.
+    ///
+    /// Unlike [`add_persisted_file`](Self::add_persisted_file) the file count is incremented only
+    /// when the file is actually inserted. A compaction notice is idempotent by design and may be
+    /// delivered more than once, so counting a re-delivery would inflate the metric permanently.
+    ///
+    /// Identity is the **path**, never the whole record. `ParquetFile` derives `PartialEq` over
+    /// every field including `id`, and the receiver mints a fresh `ParquetFileId` for each notice
+    /// it handles — so a redelivered notice compares unequal to the entry it duplicates. Matching
+    /// on the record would insert the same path a second time, report it as new, and send the
+    /// caller on to write another snapshot recording it. Repeat the delivery and it grows without
+    /// bound.
+    pub(crate) fn add_compacted_file(
+        &mut self,
+        db_id: &DbId,
+        table_id: &TableId,
+        parquet_file: &ParquetFile,
+    ) -> bool {
+        let existing_parquet_files = self
+            .files
+            .entry(*db_id)
+            .or_default()
+            .entry(*table_id)
+            .or_default();
+        if existing_parquet_files
+            .iter()
+            .any(|existing| existing.path == parquet_file.path)
+        {
+            return false;
+        }
+        self.parquet_files_row_count += parquet_file.row_count;
+        self.parquet_files_size_mb += as_mb(parquet_file.size_bytes);
+        self.parquet_files_count += 1;
+        existing_parquet_files.push(parquet_file.clone());
+        true
+    }
+
+    /// Drop files whose path appears in `paths`, returning the records that were removed.
+    ///
+    /// The records are returned rather than counted because they carry this node's `ParquetFileId`s,
+    /// which the caller needs for a snapshot's `removed_files` and cannot recover once dropped.
+    pub(crate) fn remove_files_by_path(
+        &mut self,
+        db_id: &DbId,
+        table_id: &TableId,
+        paths: &HashSet<&str>,
+    ) -> Vec<ParquetFile> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let Some(files) = self
+            .files
+            .get_mut(db_id)
+            .and_then(|tables| tables.get_mut(table_id))
+        else {
+            return Vec::new();
+        };
+
+        // Collect inside the closure and apply the counter updates after: `files` holds a mutable
+        // borrow of `self.files` for the duration of `retain`.
+        let mut removed: Vec<ParquetFile> = Vec::new();
+        let mut removed_rows = 0u64;
+        let mut removed_bytes = 0u64;
+        files.retain(|file| {
+            if paths.contains(&*file.path) {
+                removed_rows += file.row_count;
+                removed_bytes += file.size_bytes;
+                removed.push(file.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        self.parquet_files_row_count = self.parquet_files_row_count.saturating_sub(removed_rows);
+        self.parquet_files_size_mb = (self.parquet_files_size_mb - as_mb(removed_bytes)).max(0.0);
+        self.parquet_files_count = self
+            .parquet_files_count
+            .saturating_sub(removed.len() as u64);
+        removed
+    }
 }
 
 impl From<PersistedSnapshotCheckpoint> for Inner {
@@ -471,6 +621,21 @@ impl From<PersistedSnapshotCheckpoint> for Inner {
 fn as_mb(bytes: u64) -> f64 {
     let factor = (1_000 * 1_000) as f64;
     bytes as f64 / factor
+}
+
+/// Borrows the snapshots in ascending sequence order, so a fold applies each snapshot's additions
+/// before any later snapshot's removals cancel them.
+///
+/// Startup loads snapshots newest-first, which is right for reading the newest sequence numbers
+/// but wrong for replaying history: `removed_files` names files that older snapshots added, and a
+/// removal applied first matches nothing and is dropped. The file then returns when the older
+/// snapshot is folded in. Compaction makes this routine — every merge removes its inputs, and the
+/// compactor deletes those objects — so without this a node resurrects deleted paths on every
+/// restart. It also affects retention and hard-delete removals, which take the same field.
+fn ordered_oldest_first(snapshots: &[PersistedSnapshot]) -> Vec<&PersistedSnapshot> {
+    let mut ordered: Vec<&PersistedSnapshot> = snapshots.iter().collect();
+    ordered.sort_by_key(|s| s.snapshot_sequence_number);
+    ordered
 }
 
 /// Merges parquet files from a [`PersistedSnapshot`] into the db/table hierarchy.

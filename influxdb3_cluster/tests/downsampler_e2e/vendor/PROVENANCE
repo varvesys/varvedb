@@ -1,0 +1,15 @@
+downsampler.py is vendored verbatim (byte-identical) from:
+
+  repo:      https://github.com/influxdata/influxdb3_plugins
+  path:      influxdata/downsampler/downsampler.py
+  commit:    a6ef1282a1ee07a0faa4a95b3648b636aeea5b8f
+  sha256:    801dda49f4035b0d691b7f1c6da03243de070ba97ef7c73a36f21bb47f803c0d
+  retrieved: 2026-09-07
+  license:   Apache-2.0 (see ./LICENSE)
+
+It is vendored so influxdb3_cluster/tests/downsampler_e2e.rs runs without
+network access or a dependency on the upstream repo layout. The e2e test
+verifies this sha256 at startup.
+
+Do not edit downsampler.py. To refresh it, follow the steps in
+../README.md ("Refreshing the vendored downsampler").

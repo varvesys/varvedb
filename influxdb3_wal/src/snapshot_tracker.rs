@@ -186,6 +186,18 @@ impl SnapshotTracker {
         self.last_snapshot_sequence_number
     }
 
+    /// Take the next snapshot sequence number without producing a snapshot.
+    ///
+    /// Used when something other than the WAL flush path needs to write a snapshot manifest into
+    /// this node's prefix — a compaction, for instance, which replaces persisted Parquet without
+    /// any WAL activity to trigger the normal path.
+    ///
+    /// The caller owns writing the manifest. If it never does, the number is simply skipped: the
+    /// tracker is a counter, and nothing downstream requires the sequence to be contiguous.
+    pub(crate) fn reserve_snapshot_sequence_number(&mut self) -> SnapshotSequenceNumber {
+        self.increment_snapshot_sequence_number()
+    }
+
     #[cfg(test)]
     pub(crate) fn num_wal_periods(&self) -> usize {
         self.wal_periods.len()

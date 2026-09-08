@@ -5,3 +5,4 @@
 //! separate crate, this module becomes the crate root.
 
 pub mod format;
+pub mod trigger_placement;

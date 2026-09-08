@@ -11,7 +11,8 @@ use hashbrown::HashMap;
 use influxdb3_shutdown::{CancellationToken, ShutdownToken};
 use iox_time::TimeProvider;
 use object_store::path::{Path, PathPart};
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, PutPayload};
+use object_store_utils::{PutNonce, SelfVerifyingCreate};
 use observability_deps::tracing::{debug, error, info, trace, warn};
 use std::time::{Duration, Instant};
 use std::{str::FromStr, sync::Arc};
@@ -335,6 +336,9 @@ impl WalObjectStore {
         let data = crate::serialize::serialize_to_file_bytes(&wal_contents)
             .expect("unable to serialize wal contents into bytes for file");
         let data = Bytes::from(data);
+        // One nonce per WAL file, minted outside the retry loop below so that
+        // every attempt at this file carries the same one.
+        let nonce = PutNonce::generate();
 
         let mut retry_count = 0;
 
@@ -345,27 +349,26 @@ impl WalObjectStore {
                 .put_opts(
                     &wal_path,
                     PutPayload::from_bytes(data.clone()),
-                    PutOptions {
-                        mode: PutMode::Create,
-                        ..Default::default()
-                    },
+                    SelfVerifyingCreate::with_nonce(nonce.clone()).put_options(),
                 )
                 .await
             {
                 Ok(_) => {
                     break;
                 }
-                // In the event that the WAL file has already been written, we want to stop the
-                // process. This would be due to someone running multiple processes with the same
-                // `--node-id` simultaneously. Whether that is intentional or not, we have to stop
-                // the process so that either the other running process can take over, or so that
-                // the operator can intervene and correct the state of their object store.
+                // A WAL file already exists at this path and is not one of this writer's own
+                // retries. The likeliest cause is a second process running with the same
+                // `--node-id`. Whatever the cause we stop, so that the other process can take
+                // over or the operator can correct the state of the object store.
                 Err(object_store::Error::AlreadyExists { path, source }) => {
                     error!(
                         path,
                         ?source,
-                        "invoking shutdown after attempt to persist a WAL file \
-                        that already exists on the object store"
+                        "invoking shutdown: a WAL file this process was writing already exists \
+                        on the object store; check for another process running with the same \
+                        --node-id. Where write verification is active, a store that discards \
+                        object metadata or a WAL file left by an older build can produce the \
+                        same result"
                     );
                     // update the state on the wal buffer so that new writes are not
                     // accepted:
@@ -650,12 +653,33 @@ impl Wal for WalObjectStore {
             .last_wal_sequence_number()
     }
 
+    async fn last_persisted_wal_sequence_number(&self) -> WalFileSequenceNumber {
+        // Tracked by the remover: seeded at construction from the persisted-snapshot watermark and
+        // advanced only by `remove_snapshot_wal_files` after a real snapshot lands its Parquet.
+        // Never ahead of what is in object store; a lagging value only makes replay re-buffer a few
+        // already-persisted files, which the next snapshot cleans up.
+        self.wal_remover.last_snapshotted().unwrap_or_default()
+    }
+
     async fn last_snapshot_sequence_number(&self) -> SnapshotSequenceNumber {
         self.flush_buffer
             .lock()
             .await
             .snapshot_tracker
             .last_snapshot_sequence_number()
+    }
+
+    async fn reserve_snapshot_sequence_number(&self) -> SnapshotSequenceNumber {
+        // Allocating under the same lock the flush path uses is what makes this safe: a concurrent
+        // `flush_buffer` cannot observe or reuse the number handed out here.
+        //
+        // The lock is released before the caller writes anything, which mirrors the flush path —
+        // it too allocates under this lock and PUTs the WAL file after releasing it.
+        self.flush_buffer
+            .lock()
+            .await
+            .snapshot_tracker
+            .reserve_snapshot_sequence_number()
     }
 
     async fn shutdown(&self) {
@@ -982,6 +1006,12 @@ impl WalFileRemover {
         let mut inner = self.inner.lock();
         inner.update_last_wal_num(last_wal);
         inner.get_current_state()
+    }
+
+    /// The last WAL sequence number a completed snapshot has persisted. `None` before the first
+    /// snapshot on a node that started with no persisted snapshots.
+    fn last_snapshotted(&self) -> Option<WalFileSequenceNumber> {
+        self.inner.lock().last_snapshotted_wal_sequence_number
     }
 }
 

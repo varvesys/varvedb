@@ -105,8 +105,35 @@ pub trait Wal: Debug + Send + Sync + 'static {
     /// Returns the last persisted wal file sequence number
     async fn last_wal_sequence_number(&self) -> WalFileSequenceNumber;
 
+    /// The last WAL file sequence number whose data is durably in Parquet — the replay
+    /// watermark.
+    ///
+    /// Unlike [`last_wal_sequence_number`](Self::last_wal_sequence_number), which is the newest WAL
+    /// file that *exists*, everything at or below this has been snapshotted. A snapshot that records
+    /// only a Parquet-level change and no buffered rows — a compaction — must stamp its
+    /// `wal_file_sequence_number` with this value, not the newer one, or a restart treats the
+    /// still-un-persisted WAL files above it as already snapshotted and skips them.
+    async fn last_persisted_wal_sequence_number(&self) -> WalFileSequenceNumber;
+
     /// Returns the last persisted wal file sequence number
     async fn last_snapshot_sequence_number(&self) -> SnapshotSequenceNumber;
+
+    /// Allocate the next snapshot sequence number without producing a snapshot.
+    ///
+    /// For writers of snapshot manifests that the WAL flush path does not drive. Compaction is the
+    /// motivating case: it replaces persisted Parquet with no WAL activity to trigger a snapshot,
+    /// and an idle node produces no WAL periods at all, so waiting for the normal path would strand
+    /// the change in memory indefinitely.
+    ///
+    /// **The caller owns writing the manifest.** Reading `last_snapshot_sequence_number` and adding
+    /// one is *not* equivalent — that reserves nothing, and the flush path would hand the same
+    /// number to a real snapshot, whose unconditional PUT then overwrites whichever manifest lost
+    /// the race.
+    ///
+    /// A number that is never written leaves a gap. Gaps are harmless: replay compares a WAL file's
+    /// recorded sequence against the pre-replay high-water mark rather than assuming contiguity,
+    /// and every other consumer orders by `>` alone.
+    async fn reserve_snapshot_sequence_number(&self) -> SnapshotSequenceNumber;
 
     /// Stop all writes to the WAL and flush the buffer to a WAL file.
     async fn shutdown(&self);

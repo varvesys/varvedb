@@ -13,6 +13,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::RecordBatchStream;
 use datafusion::execution::memory_pool::UnboundedMemoryPool;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::FutureExt;
 use futures::{StreamExt, TryStreamExt};
 use http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_LENGTH};
@@ -465,6 +466,11 @@ struct V2WriteApiError(Error);
 impl V2WriteApiError {
     fn to_code(&self) -> V2WriteErrorCode {
         match &self.0 {
+            // Must precede the catch-all `Error::WriteBuffer(_)` arm below, which would report
+            // this as `invalid` — telling the operator their line protocol was malformed and
+            // sending them to inspect data that was in fact fine. The node, not the write, is the
+            // problem, and the other write endpoints already say so with 421.
+            Error::WriteBuffer(WriteBufferError::NodeIsQueryOnly) => V2WriteErrorCode::Misdirected,
             Error::NonUtf8Body(_)
             | Error::NonUtf8ContentEncodingHeader(_)
             | Error::NonUtf8ContentTypeHeader(_)
@@ -517,6 +523,8 @@ enum V2WriteErrorCode {
     NotFound,
     RequestTooLarge,
     InternalError,
+    /// The request reached a node that cannot serve it — a query-only node asked to accept a write.
+    Misdirected,
 }
 
 impl V2WriteErrorCode {
@@ -528,6 +536,7 @@ impl V2WriteErrorCode {
             Self::NotFound => "not found",
             Self::RequestTooLarge => "request too large",
             Self::InternalError => "internal error",
+            Self::Misdirected => "misdirected",
         }
     }
 
@@ -539,6 +548,7 @@ impl V2WriteErrorCode {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Misdirected => StatusCode::MISDIRECTED_REQUEST,
         }
     }
 }
@@ -661,6 +671,7 @@ impl IntoResponse for CatalogError {
             }
             Self::AlreadyExists
             | Self::AlreadyDeleted(_)
+            | Self::TokenHashAlreadyExists
             | Self::NodeNotFullyStopped { .. }
             | Self::NodeModeNotRemovable { .. }
             | Self::NodeInQueryGroup { .. } => Either::Right(StatusCode::CONFLICT),
@@ -767,6 +778,20 @@ impl IntoResponse for Error {
                 .status(StatusCode::BAD_REQUEST)
                 .body(bytes_to_response_body(err.to_string()))
                 .unwrap(),
+            // 421 is the precise code for this: the request reached a server that cannot produce a
+            // response for it, and the client should retry against a different one. A 500 would
+            // send operators looking for a fault that does not exist.
+            Self::WriteBuffer(err @ WriteBufferError::NodeIsQueryOnly) => {
+                let err: ErrorMessage<()> = ErrorMessage {
+                    error: err.to_string(),
+                    data: None,
+                };
+                let serialized = serde_json::to_string(&err).unwrap();
+                ResponseBuilder::new()
+                    .status(StatusCode::MISDIRECTED_REQUEST)
+                    .body(bytes_to_response_body(serialized))
+                    .unwrap()
+            }
             Self::WriteBuffer(err @ WriteBufferError::ColumnDoesNotExist(_)) => {
                 let err: ErrorMessage<()> = ErrorMessage {
                     error: err.to_string(),
@@ -2378,6 +2403,31 @@ async fn record_batch_stream_to_body(
     mut stream: Pin<Box<dyn RecordBatchStream + Send>>,
     format: QueryFormat,
 ) -> Result<ResponseBody, Error> {
+    // Peek one batch before committing to a status code.
+    //
+    // The streaming formats below hand their body to the client before anything is polled, so an
+    // error raised during the scan arrives after `200 OK` is already on the wire and can only
+    // truncate the body — the client sees a successful, empty response. Pulling the first batch
+    // here means `?` runs while we can still return a real HTTP error.
+    //
+    // This is not a complete guarantee: a scan that fails partway through still truncates. It does
+    // cover the common case, because failures that happen up front — a cluster peer being
+    // unreachable, a plan erroring on first poll — surface on this first batch.
+    //
+    // The `Parquet` arm below already relied on this trick to obtain a schema; doing it once here
+    // extends the same protection to every format.
+    let first_batch = stream.next().await.transpose()?;
+    let mut stream: Pin<Box<dyn RecordBatchStream + Send>> = match first_batch {
+        Some(batch) => {
+            let schema = stream.schema();
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter([Ok(batch)]).chain(stream),
+            ))
+        }
+        None => stream,
+    };
+
     match format {
         QueryFormat::Pretty => {
             let batches = stream.try_collect::<Vec<RecordBatch>>().await?;
