@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/varvedb-mark-512.png" alt="VarveDB" width="128">
+</p>
+
 # VarveDB
 
 VarveDB is a fork of [InfluxDB 3 Core](https://github.com/influxdata/influxdb)
