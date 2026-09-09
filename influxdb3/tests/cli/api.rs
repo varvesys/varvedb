@@ -52,7 +52,7 @@ pub(super) fn run_cmd_with_result(
     input: Option<&str>,
     command_args: Vec<&str>,
 ) -> std::result::Result<String, anyhow::Error> {
-    let mut child_process = Command::new(assert_cmd::cargo_bin!("influxdb3"))
+    let mut child_process = Command::new(assert_cmd::cargo_bin!("varvedb"))
         .args(&command_args)
         .args(args)
         .stdin(Stdio::piped())

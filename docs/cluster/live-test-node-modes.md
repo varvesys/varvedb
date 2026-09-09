@@ -50,8 +50,8 @@ a `conn_info` address; `node-compact` registers with `conn_info="<none>"`.
 
 ## Prerequisites
 
-* A built binary: `cargo build --bin influxdb3` (the script uses
-  `target/debug/influxdb3`; pass another path as `$1`).
+* A built binary: `cargo build --bin varvedb` (the script uses
+  `target/debug/varvedb`; pass another path as `$1`).
 * `curl`. No Python, no network, no auth (`--without-auth`).
 * Everything runs under a fresh `mktemp -d`; the three servers are killed on
   exit and the logs are left in `"$workdir"/logs`.
@@ -59,9 +59,9 @@ a `conn_info` address; `node-compact` registers with `conn_info="<none>"`.
 ## Running it
 
 ```sh
-cargo build --bin influxdb3
+cargo build --bin varvedb
 docs/cluster/scripts/node-modes-live-test.sh
-# or: docs/cluster/scripts/node-modes-live-test.sh /path/to/influxdb3
+# or: docs/cluster/scripts/node-modes-live-test.sh /path/to/varvedb
 ```
 
 ## The tunables that make it quick

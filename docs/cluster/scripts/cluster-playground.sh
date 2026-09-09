@@ -11,18 +11,18 @@
 # Usage:
 #   docs/cluster/scripts/cluster-playground.sh [DATA_DIR]
 #   RESET=1 docs/cluster/scripts/cluster-playground.sh      # wipe DATA_DIR first
-#   BIN=/path/to/influxdb3 docs/cluster/scripts/cluster-playground.sh
+#   BIN=/path/to/varvedb docs/cluster/scripts/cluster-playground.sh
 #
 # Ctrl-C shuts every node down cleanly. Data and logs persist under DATA_DIR
 # between runs unless RESET=1.
 set -euo pipefail
 
-BIN="${BIN:-$PWD/target/debug/influxdb3}"
+BIN="${BIN:-$PWD/target/debug/varvedb}"
 DATA_DIR="${1:-$PWD/.cluster-playground}"
 CLUSTER_ID="${CLUSTER_ID:-playground}"
 
-[ -x "$BIN" ] || { echo "influxdb3 binary not found/executable: $BIN" >&2
-                   echo "build it with: cargo build --bin influxdb3" >&2; exit 1; }
+[ -x "$BIN" ] || { echo "varvedb binary not found/executable: $BIN" >&2
+                   echo "build it with: cargo build --bin varvedb" >&2; exit 1; }
 
 if [ "${RESET:-0}" = "1" ]; then rm -rf "$DATA_DIR"; fi
 LOGS="$DATA_DIR/logs"

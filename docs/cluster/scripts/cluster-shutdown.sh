@@ -9,7 +9,7 @@
 #   CLUSTER_ID=playground docs/cluster/scripts/cluster-shutdown.sh
 #
 # Stops nodes recorded in DATA_DIR/cluster.pids, then sweeps for any leftover
-# `influxdb3 serve` process for this --data-dir / --cluster-id. Data and logs
+# `varvedb serve` process for this --data-dir / --cluster-id. Data and logs
 # under DATA_DIR are left untouched.
 set -euo pipefail
 
@@ -41,9 +41,9 @@ else
 fi
 
 # sweep: catch anything the pidfile missed (stale file, manual starts, etc.)
-LEFT="$(pgrep -f "influxdb3 serve.*--cluster-id $CLUSTER_ID" 2>/dev/null || true)"
+LEFT="$(pgrep -f "varvedb serve.*--cluster-id $CLUSTER_ID" 2>/dev/null || true)"
 if [ -n "$LEFT" ]; then
-  echo "sweeping leftover influxdb3 serve --cluster-id $CLUSTER_ID ..."
+  echo "sweeping leftover varvedb serve --cluster-id $CLUSTER_ID ..."
   # shellcheck disable=SC2086
   term_wait_kill $LEFT
 fi

@@ -48,7 +48,7 @@ flowchart LR
 ## Run it
 
 ```sh
-cargo build --bin influxdb3
+cargo build --bin varvedb
 
 # foreground; Ctrl-C stops all five
 docs/cluster/scripts/cluster-playground.sh
@@ -56,7 +56,7 @@ docs/cluster/scripts/cluster-playground.sh
 # options
 docs/cluster/scripts/cluster-playground.sh /path/to/data     # choose the data dir
 RESET=1 docs/cluster/scripts/cluster-playground.sh           # wipe the data dir first
-BIN=/path/to/influxdb3 docs/cluster/scripts/cluster-playground.sh
+BIN=/path/to/varvedb docs/cluster/scripts/cluster-playground.sh
 ```
 
 Data and logs persist under the data dir (`./.cluster-playground` by default)

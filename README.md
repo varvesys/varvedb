@@ -31,7 +31,7 @@ coordinator, no gossip, and no node-to-node dependency for durability.
 Build the binary, then stand up a local cluster:
 
 ```sh
-cargo build --bin influxdb3
+cargo build --bin varvedb
 ```
 
 **A cluster you drive yourself** — 2 ingest + 2 query + 1 compact node, one

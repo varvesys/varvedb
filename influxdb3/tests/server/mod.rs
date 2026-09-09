@@ -521,7 +521,7 @@ impl TestServer {
         let admin_token_recover_tmp_dir_path = admin_token_recover_tmp_dir.keep();
         let tcp_addr_file_2 = admin_token_recover_tmp_dir_path.join("tcp-listener");
 
-        let mut command = Command::new(assert_cmd::cargo_bin!("influxdb3"));
+        let mut command = Command::new(assert_cmd::cargo_bin!("varvedb"));
         let mut command = command
             .arg("serve")
             .arg("--disable-telemetry-upload")

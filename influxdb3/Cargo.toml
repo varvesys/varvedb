@@ -10,7 +10,7 @@ name = "influxdb3_lib"
 path = "src/lib.rs"
 
 [[bin]]
-name = "influxdb3"
+name = "varvedb"
 path = "src/main.rs"
 
 [lints]

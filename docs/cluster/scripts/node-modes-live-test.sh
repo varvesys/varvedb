@@ -11,11 +11,11 @@
 #   4. cross-node compaction  — node-compact merges node-ingest's small cold gen1 Parquet
 #                               into one file; the cluster-wide row count is conserved
 #
-# Usage: node-modes-live-test.sh [path-to-influxdb3-binary]
+# Usage: node-modes-live-test.sh [path-to-varvedb-binary]
 set -euo pipefail
 
-BIN="${1:-$(pwd)/target/debug/influxdb3}"
-[ -x "$BIN" ] || { echo "influxdb3 binary not found/executable: $BIN" >&2; exit 1; }
+BIN="${1:-$(pwd)/target/debug/varvedb}"
+[ -x "$BIN" ] || { echo "varvedb binary not found/executable: $BIN" >&2; exit 1; }
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/varvedb-nodemodes.XXXXXX")"
 DATA="$ROOT/data"; LOGS="$ROOT/logs"
