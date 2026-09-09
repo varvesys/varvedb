@@ -20,11 +20,72 @@ layers are live.
   manifest polling.
 - **Cluster-aware Processing Engine** — trigger placement across nodes, so
   scheduled and request plugins run where you pin them instead of everywhere.
-- **Node modes** — run ingest, query, and compaction as separate tiers, or
-  combined on a single node.
+- **Node modes** — ingest, query, compact, and process as separate tiers, or
+  `core` / `all` combined on a single node.
 
 Nodes share nothing but object storage and a catalog. There is no
 coordinator, no gossip, and no node-to-node dependency for durability.
+
+## Architecture
+
+Every node runs the same binary and takes on a set of roles chosen with
+`--mode`. Nodes share exactly two things through object storage — one
+**catalog** (the schema) and one **cluster file index** (the log of every
+Parquet file) — and nothing else. There is no coordinator, no gossip, and no
+node-to-node dependency for durability: a node that loses every peer still
+answers from object storage.
+
+```mermaid
+flowchart LR
+  client(["client"])
+  ingest["<b>ingest</b><br/>write_lp"]
+  query["<b>query</b><br/>SQL / InfluxQL / Flight"]
+  compact["<b>compact</b><br/>(no client API)"]
+  process["<b>process</b><br/>Python triggers"]
+  store[("object store<br/>catalog + cluster file index<br/>+ per-node WAL / Parquet")]
+
+  client -- writes --> ingest
+  client -- reads --> query
+  ingest -- "WAL, gen1 Parquet,<br/>append to file index" --> store
+  query -- "replay catalog + file index" --> store
+  query <-. "un-persisted rows<br/>(Arrow Flight RPC)" .-> ingest
+  compact -- "merge peers' cold Parquet,<br/>write back + append" --> store
+  compact -. "compaction notice (RPC)" .-> ingest
+  process -- "read / write via the engine" --> query
+```
+
+| role | `--mode` | does | never |
+|------|----------|------|-------|
+| **ingest** | `ingest` | accepts line-protocol writes; buffers in the WAL, persists gen1 Parquet under its own prefix, and appends every new file to the shared index; serves its un-persisted rows to query nodes over Arrow Flight | — |
+| **query** | `query` | serves SQL / InfluxQL / Flight, reading cluster-wide: the shared catalog, every peer's Parquet via the replayed file index, and ingesters' buffered rows over RPC | accepts writes (returns `421`); persists anything; publishes a peer address |
+| **compact** | `compact` | merges small, cold gen1 Parquet belonging to ingest peers into fewer large files and writes them back into the owner's prefix, then hands the owner a notice so the *owner* records the merge (it alone allocates in its sequence space); deletes merged-away inputs after `--compact-input-grace`. Exactly one per cluster | accepts writes; serves queries; combines with another role |
+| **process** | `process` (implied by `--plugin-dir`) | runs the embedded Python Processing Engine; `node_spec=nodes:<id>` on a trigger pins its scheduled / WAL / request plugins to named nodes instead of every node | — |
+
+`core` (the default) is `ingest` + `query` on one node — the original
+single-node behaviour. `all` is every role in one process and compacts its own
+Parquet in-process. `ingest`, `query`, and `process` may be combined
+(`--mode ingest,query,process`); `core`, `all`, and `compact` may not.
+
+**Shared substrate**
+
+- **Catalog** — one schema for the cluster, stored under the `--cluster-id`
+  prefix, polled on `--catalog-sync-interval`.
+- **Cluster file index** — a single compare-and-swap–appended log. One
+  cluster-wide monotonic sequence orders every Parquet addition and removal, so
+  a node can tell when its view is behind instead of silently serving short
+  results; periodic rollup snapshots collapse the log. Replayed on
+  `--file-index-sync-interval`.
+- **Per-node data** — WAL, Parquet, snapshots and table indices live under
+  `{node_id}/` and are written only by that node — the sole exception being a
+  compactor writing a merged file into an ingester's prefix, which the ingester
+  then acknowledges.
+- **Peer RPC** — Arrow Flight on `--cluster-rpc-bind`: query → ingester for
+  un-persisted rows, compactor → owner for the compaction notice. `query` and
+  `compact` nodes publish no address and are never dialled.
+
+Role assignment is static: membership is read on every query and compaction
+pass, but existing placements are not rebalanced when a node joins or leaves.
+Deeper walkthroughs and diagrams: [docs/cluster/](docs/cluster/).
 
 ## Try it
 
