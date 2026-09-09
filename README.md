@@ -26,6 +26,68 @@ layers are live.
 Nodes share nothing but object storage and a catalog. There is no
 coordinator, no gossip, and no node-to-node dependency for durability.
 
+## Try it
+
+Build the binary, then stand up a local cluster:
+
+```sh
+cargo build --bin influxdb3
+```
+
+**A cluster you drive yourself** — 2 ingest + 2 query + 1 compact node, one
+shared local object store, no auth:
+
+```sh
+docs/cluster/scripts/cluster-playground.sh          # Ctrl-C to stop all five
+```
+
+| role    | endpoints                                          |
+|---------|---------------------------------------------------|
+| ingest  | `http://127.0.0.1:8181`, `http://127.0.0.1:8182`  |
+| query   | `http://127.0.0.1:8183`, `http://127.0.0.1:8184`  |
+| compact | background only — merges the ingesters' cold Parquet |
+
+Write line protocol to an **ingest** node:
+
+```sh
+curl -sS "http://127.0.0.1:8181/api/v3/write_lp?db=sensors&precision=second" \
+  --data-binary "cpu,host=a,region=west usage=0.62,temp=48 $(date +%s)"
+# -> HTTP 204
+```
+
+Query from a **query** node — it sees data from every ingester, cluster-wide:
+
+```sh
+curl -sS --get "http://127.0.0.1:8183/api/v3/query_sql" \
+  --data-urlencode "db=sensors" \
+  --data-urlencode "q=SELECT host, count(*) n, avg(usage) avg_usage FROM cpu GROUP BY host" \
+  --data-urlencode "format=jsonl"
+# {"host":"a","n":1,"avg_usage":0.62}
+# {"host":"b","n":2,"avg_usage":0.63}
+```
+
+A write sent to a query node is refused:
+
+```sh
+curl -sS -i "http://127.0.0.1:8183/api/v3/write_lp?db=sensors" --data-binary "cpu x=1"
+# HTTP/1.1 421 Misdirected Request
+# {"error":"this node runs in query-only mode and does not accept writes; ..."}
+```
+
+Stop it from another shell with
+[`docs/cluster/scripts/cluster-shutdown.sh`](docs/cluster/scripts/cluster-shutdown.sh).
+
+More, including InfluxQL and how to watch the compactor:
+[docs/cluster/cluster-playground.md](docs/cluster/cluster-playground.md).
+
+**A scripted, self-checking walkthrough** of the same roles — write routing,
+cluster-wide reads, and cross-node compaction with assertions —
+[docs/cluster/live-test-node-modes.md](docs/cluster/live-test-node-modes.md):
+
+```sh
+docs/cluster/scripts/node-modes-live-test.sh
+```
+
 ## Status
 
 Experimental. Not affiliated with or endorsed by InfluxData.
