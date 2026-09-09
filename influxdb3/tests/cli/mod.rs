@@ -74,7 +74,7 @@ fn test_telemetry_disabled_with_debug_msg() {
     let expected_disabled: &str = "Initializing TelemetryStore with upload disabled.";
 
     // validate we get a debug message indicating upload disabled
-    let output = cargo_bin_cmd!("influxdb3")
+    let output = cargo_bin_cmd!("varvedb")
         .args(serve_args)
         .arg("-vv")
         .arg("--disable-telemetry-upload")
@@ -102,7 +102,7 @@ fn test_telemetry_disabled() {
 
     let expected_disabled: &str = "Initializing TelemetryStore with upload disabled.";
     // validate no message when debug output disabled
-    let output = cargo_bin_cmd!("influxdb3")
+    let output = cargo_bin_cmd!("varvedb")
         .args(serve_args)
         .arg("-v")
         .arg("--disable-telemetry-upload")
@@ -132,7 +132,7 @@ fn test_telemetry_enabled_with_debug_msg() {
         "Initializing TelemetryStore with upload enabled for http://localhost:9999.";
 
     // validate debug output shows which endpoint we are hitting when telemetry enabled
-    let output = cargo_bin_cmd!("influxdb3")
+    let output = cargo_bin_cmd!("varvedb")
         .args(serve_args)
         .arg("-vv")
         .arg("--telemetry-endpoint")
@@ -163,7 +163,7 @@ fn test_telementry_enabled() {
         "Initializing TelemetryStore with upload enabled for http://localhost:9999.";
 
     // validate no telemetry endpoint reported when debug output not enabled
-    let output = cargo_bin_cmd!("influxdb3")
+    let output = cargo_bin_cmd!("varvedb")
         .args(serve_args)
         .arg("-v")
         .arg("--telemetry-endpoint")
@@ -4446,7 +4446,7 @@ async fn test_db_name_cannot_start_with_underscore_on_create_table() {
 #[test_log::test]
 fn test_create_token_requires_subcommand() {
     // Test that 'create token' command shows help instead of panicking when no subcommand is provided
-    let output = cargo_bin_cmd!("influxdb3")
+    let output = cargo_bin_cmd!("varvedb")
         .args(["create", "token"])
         .output()
         .unwrap();
@@ -4462,7 +4462,7 @@ fn test_create_token_requires_subcommand() {
     assert_not_contains!(&stderr, "thread 'main' panicked");
 
     // Test that --name alone also shows the error
-    let output_name_only = cargo_bin_cmd!("influxdb3")
+    let output_name_only = cargo_bin_cmd!("varvedb")
         .args(["create", "token", "--name", "test"])
         .output()
         .unwrap();
@@ -4475,7 +4475,7 @@ fn test_create_token_requires_subcommand() {
     );
 
     // Test that --help works properly (help goes to stdout when explicitly requested)
-    let output_help = cargo_bin_cmd!("influxdb3")
+    let output_help = cargo_bin_cmd!("varvedb")
         .args(["create", "token", "--help"])
         .output()
         .unwrap();
@@ -4490,7 +4490,7 @@ fn test_create_token_requires_subcommand() {
 
 #[test_log::test]
 fn test_write_rejects_zero_max_request_size() {
-    let output = cargo_bin_cmd!("influxdb3")
+    let output = cargo_bin_cmd!("varvedb")
         .args([
             "write",
             "--host",
@@ -4516,7 +4516,7 @@ fn test_write_rejects_zero_max_request_size() {
 
 #[test_log::test]
 fn test_write_rejects_zero_max_concurrent_requests() {
-    let output = cargo_bin_cmd!("influxdb3")
+    let output = cargo_bin_cmd!("varvedb")
         .args([
             "write",
             "--host",

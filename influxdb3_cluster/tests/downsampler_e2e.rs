@@ -14,11 +14,11 @@
 //! Ignored by default: it spawns servers, needs the built binary and a Python >= 3.11.
 //!
 //! ```text
-//! cargo build --bin influxdb3
+//! cargo build --bin varvedb
 //! cargo test -p influxdb3_cluster --test downsampler_e2e -- --ignored --nocapture
 //! ```
 //!
-//! Binary lookup: `$INFLUXDB3_BIN`, else `<target>/{debug,release}/influxdb3`.
+//! Binary lookup: `$VARVEDB_BIN`, else `<target>/{debug,release}/varvedb`.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -36,24 +36,24 @@ const DOWNSAMPLER_SHA256: &str =
 // prerequisites
 // ---------------------------------------------------------------------------
 
-fn influxdb3_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("INFLUXDB3_BIN") {
+fn varvedb_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("VARVEDB_BIN") {
         let p = PathBuf::from(p);
-        assert!(p.is_file(), "INFLUXDB3_BIN={} is not a file", p.display());
+        assert!(p.is_file(), "VARVEDB_BIN={} is not a file", p.display());
         return p;
     }
     let target = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target"));
     for profile in ["debug", "release"] {
-        let cand = target.join(profile).join("influxdb3");
+        let cand = target.join(profile).join("varvedb");
         if cand.is_file() {
             return cand;
         }
     }
     panic!(
-        "influxdb3 binary not found under {} — run `cargo build --bin influxdb3` \
-         (or set INFLUXDB3_BIN)",
+        "varvedb binary not found under {} — run `cargo build --bin varvedb` \
+         (or set VARVEDB_BIN)",
         target.display()
     );
 }
@@ -252,9 +252,9 @@ fn run_bin(bin: &Path, args: &[&str]) {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "process-level e2e; run with --ignored after `cargo build --bin influxdb3`"]
+#[ignore = "process-level e2e; run with --ignored after `cargo build --bin varvedb`"]
 fn downsampler_cluster_wide_and_calendar_rollups() {
-    let bin = influxdb3_bin();
+    let bin = varvedb_bin();
     let py = python3();
 
     // vendored plugin integrity

@@ -33,14 +33,14 @@ cluster and visible from a node that never ran a plugin.
 ## Running it
 
 ```sh
-cargo build --bin influxdb3
+cargo build --bin varvedb
 cargo test -p influxdb3_cluster --test downsampler_e2e -- --ignored --nocapture
 ```
 
 Requirements:
 
-* the `influxdb3` binary — found via `$INFLUXDB3_BIN`, else
-  `<target>/{debug,release}/influxdb3`;
+* the `varvedb` binary — found via `$VARVEDB_BIN`, else
+  `<target>/{debug,release}/varvedb`;
 * a `python3` >= 3.11 on `PATH` (the downsampler imports `tomllib`); the test creates
   an offline `venv` under a temp dir — no `pip`, no network.
 
