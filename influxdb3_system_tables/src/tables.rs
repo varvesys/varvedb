@@ -6,6 +6,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::{error::DataFusionError, logical_expr::Expr};
 use influxdb3_catalog::catalog::Catalog;
+use influxdb3_catalog::catalog::RetentionPeriod;
 use iox_system_tables::IoxSystemTable;
 
 #[derive(Debug)]
@@ -31,6 +32,7 @@ fn tables_schema() -> SchemaRef {
         Field::new("series_key_columns", DataType::Utf8View, false),
         Field::new("last_cache_count", DataType::UInt64, false),
         Field::new("distinct_cache_count", DataType::UInt64, false),
+        Field::new("retention_period_ns", DataType::UInt64, true),
         Field::new("deleted", DataType::Boolean, false),
         Field::new(
             "hard_deletion_time",
@@ -66,6 +68,7 @@ impl IoxSystemTable for TablesTable {
         let mut series_key_arr = StringViewBuilder::with_capacity(total_tables);
         let mut last_cache_count_arr = UInt64Builder::with_capacity(total_tables);
         let mut distinct_cache_count_arr = UInt64Builder::with_capacity(total_tables);
+        let mut retention_period_arr = UInt64Builder::with_capacity(total_tables);
         let mut deleted_arr = arrow::array::BooleanBuilder::with_capacity(total_tables);
         let mut hard_deletion_time_arr =
             arrow::array::TimestampSecondBuilder::with_capacity(total_tables).with_data_type(
@@ -85,6 +88,14 @@ impl IoxSystemTable for TablesTable {
                 last_cache_count_arr.append_value(table.last_caches.resource_iter().count() as u64);
                 distinct_cache_count_arr
                     .append_value(table.distinct_caches.resource_iter().count() as u64);
+
+                match table.retention_period {
+                    RetentionPeriod::Indefinite => retention_period_arr.append_null(),
+                    RetentionPeriod::Duration(duration) => {
+                        retention_period_arr.append_value(duration.as_nanos() as u64);
+                    }
+                }
+
                 deleted_arr.append_value(table.deleted);
 
                 if let Some(hard_delete_time) = &table.hard_delete_time {
@@ -102,6 +113,7 @@ impl IoxSystemTable for TablesTable {
             Arc::new(series_key_arr.finish()),
             Arc::new(last_cache_count_arr.finish()),
             Arc::new(distinct_cache_count_arr.finish()),
+            Arc::new(retention_period_arr.finish()),
             Arc::new(deleted_arr.finish()),
             Arc::new(hard_deletion_time_arr.finish()),
         ];

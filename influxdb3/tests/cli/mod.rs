@@ -4,6 +4,7 @@ mod db_retention;
 mod log_filter;
 mod offline_tokens;
 mod system_tables;
+mod table_retention;
 mod tls_no_verify;
 
 use crate::server::{ConfigProvider, TestServer};

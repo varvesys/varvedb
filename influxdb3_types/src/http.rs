@@ -328,6 +328,17 @@ pub struct CreateTableRequest {
     pub table: String,
     pub tags: Vec<String>,
     pub fields: Vec<CreateTableField>,
+    #[serde(with = "humantime_serde", default)]
+    pub retention_period: Option<Duration>,
+}
+
+/// Request definition for the `PUT /api/v3/configure/table` API
+#[derive(Debug, Deserialize, Serialize)]
+pub struct UpdateTableRequest {
+    pub db: String,
+    pub table: String,
+    #[serde(with = "humantime_serde", default)]
+    pub retention_period: Option<Duration>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

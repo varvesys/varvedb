@@ -1950,6 +1950,40 @@ impl HttpApi {
         Ok(Response::new(empty_response_body()))
     }
 
+    async fn update_table(&self, req: Request) -> Result<Response> {
+        let update_req = self.read_body_json::<UpdateTableRequest>(req).await?;
+
+        match update_req.retention_period {
+            Some(duration) => {
+                info!(
+                    database = %update_req.db,
+                    table = %update_req.table,
+                    retention_period_secs = duration.as_secs(),
+                    "setting retention period for table"
+                );
+
+                self.write_buffer
+                    .catalog()
+                    .set_retention_period_for_table(&update_req.db, &update_req.table, duration)
+                    .await?;
+            }
+            None => {
+                info!(
+                    database = %update_req.db,
+                    table = %update_req.table,
+                    "clearing retention period for table"
+                );
+
+                self.write_buffer
+                    .catalog()
+                    .clear_retention_period_for_table(&update_req.db, &update_req.table)
+                    .await?;
+            }
+        }
+
+        Ok(Response::new(empty_response_body()))
+    }
+
     async fn delete_database(&self, req: Request) -> Result<Response> {
         let query = req.uri().query().unwrap_or("");
         let delete_req = serde_urlencoded::from_str::<DeleteDatabaseRequest>(query)?;
@@ -1981,11 +2015,12 @@ impl HttpApi {
             table,
             tags,
             fields,
+            retention_period,
         } = self.read_body_json(req).await?;
         validate_db_name(&db)?;
         self.write_buffer
             .catalog()
-            .create_table(
+            .create_table_opts(
                 &db,
                 &table,
                 &tags,
@@ -1993,6 +2028,10 @@ impl HttpApi {
                     .into_iter()
                     .map(|field| (field.name, field.r#type.into()))
                     .collect::<Vec<(String, FieldDataType)>>(),
+                influxdb3_catalog::catalog::CreateTableOptions {
+                    retention_period,
+                    ..Default::default()
+                },
             )
             .await?;
         Ok(Response::new(empty_response_body()))
@@ -2890,6 +2929,7 @@ async fn perform_routing(
             http_server.delete_database(req).await
         }
         (Method::POST, all_paths::API_V3_CONFIGURE_TABLE) => http_server.create_table(req).await,
+        (Method::PUT, all_paths::API_V3_CONFIGURE_TABLE) => http_server.update_table(req).await,
         (Method::DELETE, all_paths::API_V3_CONFIGURE_TABLE) => http_server.delete_table(req).await,
         (Method::POST, all_paths::API_V3_TEST_WAL_ROUTE) => {
             http_server.test_processing_engine_wal_plugin(req).await

@@ -265,6 +265,11 @@ pub struct TableConfig {
     /// The name of the table to be created
     table_name: String,
 
+    #[clap(long = "retention-period")]
+    /// The retention period for the table as a human-readable duration, e.g., "30d", "24h".
+    /// Overrides the database's own retention period for this table only.
+    retention_period: Option<Duration>,
+
     /// An optional arg to use a custom CA, useful for testing with self-signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
@@ -409,6 +414,7 @@ pub async fn command(config: Config) -> Result<(), Box<dyn Error>> {
             table_name,
             tags,
             fields,
+            retention_period,
             ..
         }) => {
             client
@@ -417,6 +423,7 @@ pub async fn command(config: Config) -> Result<(), Box<dyn Error>> {
                     &table_name,
                     tags.unwrap_or_default(),
                     fields,
+                    retention_period.map(Into::into),
                 )
                 .await?;
 

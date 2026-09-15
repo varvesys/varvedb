@@ -224,8 +224,11 @@ pub(crate) async fn command(config: Config) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Show retention policies for databases.
-/// This queries system.databases to show database-level retention periods.
+/// Show the effective retention period for every table, joining `system.tables`
+/// (a table's own override, if any) with `system.databases` (the fallback) via
+/// `COALESCE` — the same table-then-database precedence
+/// `DatabaseSchema::retention_period_cutoff` applies when enforcement actually
+/// runs, so this can never disagree with what the retention handler does.
 async fn show_retention_policies(config: RetentionConfig) -> Result<(), Box<dyn Error>> {
     let mut client = influxdb3_client::Client::new(
         config.host_url.clone(),
@@ -237,29 +240,26 @@ async fn show_retention_policies(config: RetentionConfig) -> Result<(), Box<dyn 
         client = client.with_auth_token(t.expose_secret());
     }
 
-    // Build the SQL query to show database retention policies
-    let query = if let Some(db) = &config.database {
-        format!(
-            "SELECT \
-                database_name, \
-                CASE \
-                    WHEN retention_period_ns IS NULL THEN 'infinite' \
-                    WHEN retention_period_ns % 86400000000000 = 0 THEN \
-                        CAST(retention_period_ns / 86400000000000 AS VARCHAR) || 'd' \
-                    WHEN retention_period_ns % 3600000000000 = 0 THEN \
-                        CAST(retention_period_ns / 3600000000000 AS VARCHAR) || 'h' \
-                    WHEN retention_period_ns % 60000000000 = 0 THEN \
-                        CAST(retention_period_ns / 60000000000 AS VARCHAR) || 'm' \
-                    ELSE CAST(retention_period_ns / 1000000000 AS VARCHAR) || 's' \
-                END as retention_period \
-            FROM system.databases \
-            WHERE database_name = '{}' \
-            ORDER BY database_name",
-            db.replace('\'', "''") // Escape single quotes
-        )
+    let where_clause = if let Some(db) = &config.database {
+        format!("WHERE t.database_name = '{}'", db.replace('\'', "''"))
     } else {
-        "SELECT \
-            database_name, \
+        String::new()
+    };
+
+    // Build the SQL query to show the effective per-table retention policy.
+    // The CAST to BIGINT matters: dividing the raw UInt64 system-table column
+    // below (e.g. retention_period_ns / 86400000000000) promotes to a
+    // fractional type and prints "30.0000" instead of "30" otherwise.
+    let query = format!(
+        "WITH effective AS ( \
+            SELECT t.database_name, t.table_name, \
+                   CAST(COALESCE(t.retention_period_ns, d.retention_period_ns) AS BIGINT) \
+                       AS retention_period_ns \
+            FROM system.tables t \
+            JOIN system.databases d ON t.database_name = d.database_name \
+            {where_clause} \
+        ) \
+        SELECT database_name, table_name, \
             CASE \
                 WHEN retention_period_ns IS NULL THEN 'infinite' \
                 WHEN retention_period_ns % 86400000000000 = 0 THEN \
@@ -270,10 +270,9 @@ async fn show_retention_policies(config: RetentionConfig) -> Result<(), Box<dyn 
                     CAST(retention_period_ns / 60000000000 AS VARCHAR) || 'm' \
                 ELSE CAST(retention_period_ns / 1000000000 AS VARCHAR) || 's' \
             END as retention_period \
-        FROM system.databases \
-        ORDER BY database_name"
-            .to_string()
-    };
+        FROM effective \
+        ORDER BY database_name, table_name"
+    );
 
     let resp_bytes = client
         .api_v3_query_sql("_internal", query)
