@@ -949,7 +949,7 @@ impl TestServer {
         let client = self.maybe_authorized_client();
 
         client
-            .api_v3_configure_table_create(database, table, tags, fields)
+            .api_v3_configure_table_create(database, table, tags, fields, None)
             .await
     }
 

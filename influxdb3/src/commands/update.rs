@@ -17,6 +17,8 @@ pub struct Config {
 pub enum SubCommand {
     /// Update a database
     Database(UpdateDatabase),
+    /// Update a table
+    Table(UpdateTable),
     /// Update a trigger's plugin file
     Trigger(UpdateTrigger),
 }
@@ -25,6 +27,28 @@ pub enum SubCommand {
 pub struct UpdateDatabase {
     #[clap(flatten)]
     influxdb3_config: InfluxDb3Config,
+
+    /// The retention period as a human-readable duration (e.g., "30d", "24h") or "none" to clear
+    #[clap(long, short = 'r')]
+    retention_period: Option<String>,
+
+    /// An optional arg to use a custom CA, useful for testing with self-signed certs
+    #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
+    ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct UpdateTable {
+    #[clap(flatten)]
+    influxdb3_config: InfluxDb3Config,
+
+    /// The name of the table to update
+    #[clap(required = true)]
+    table_name: String,
 
     /// The retention period as a human-readable duration (e.g., "30d", "24h") or "none" to clear
     #[clap(long, short = 'r')]
@@ -93,6 +117,39 @@ pub async fn command(config: Config) -> Result<(), Box<dyn Error>> {
                 println!("Database \"{database_name}\" updated successfully");
             } else {
                 return Err("--retention-period is required for update database".into());
+            }
+        }
+        SubCommand::Table(UpdateTable {
+            influxdb3_config:
+                InfluxDb3Config {
+                    host_url,
+                    auth_token,
+                    database_name,
+                    ..
+                },
+            table_name,
+            retention_period,
+            ca_cert,
+            tls_no_verify,
+        }) => {
+            let mut client = Client::new(host_url, ca_cert, tls_no_verify)?;
+            if let Some(token) = &auth_token {
+                client = client.with_auth_token(token.expose_secret());
+            }
+
+            if let Some(retention_str) = retention_period {
+                let retention = if retention_str.to_lowercase() == "none" {
+                    None
+                } else {
+                    Some(retention_str.parse::<Duration>()?.into())
+                };
+                client
+                    .api_v3_configure_table_update(&database_name, &table_name, retention)
+                    .await?;
+
+                println!("Table \"{database_name}\".\"{table_name}\" updated successfully");
+            } else {
+                return Err("--retention-period is required for update table".into());
             }
         }
         SubCommand::Trigger(UpdateTrigger {

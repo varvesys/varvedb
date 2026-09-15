@@ -561,6 +561,29 @@ impl Client {
         Ok(())
     }
 
+    /// Make a request to the `PUT /api/v3/configure/table` API
+    pub async fn api_v3_configure_table_update(
+        &self,
+        db: impl Into<String> + Send,
+        table: impl Into<String> + Send,
+        retention_period: Option<Duration>,
+    ) -> Result<()> {
+        let _bytes = self
+            .send_json_get_bytes(
+                Method::PUT,
+                "/api/v3/configure/table",
+                Some(UpdateTableRequest {
+                    db: db.into(),
+                    table: table.into(),
+                    retention_period,
+                }),
+                None::<()>,
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Make a request to the `DELETE /api/v3/configure/table?db=foo&table=bar` API
     pub async fn api_v3_configure_table_delete<T: AsRef<str> + Send>(
         &self,
@@ -613,6 +636,7 @@ impl Client {
         table: impl Into<String> + Send,
         tags: Vec<impl Into<String> + Send>,
         fields: Vec<(impl Into<String> + Send, impl Into<FieldType> + Send)>,
+        retention_period: Option<Duration>,
     ) -> Result<()> {
         let _bytes = self
             .send_json_get_bytes(
@@ -629,6 +653,7 @@ impl Client {
                             r#type: r#type.into(),
                         })
                         .collect(),
+                    retention_period,
                 }),
                 None::<()>,
                 None,
